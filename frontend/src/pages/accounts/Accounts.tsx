@@ -7,6 +7,8 @@ import { checkDefaultPassword } from '@/api/settings'
 import { useUIStore } from '@/store/uiStore'
 import { useAuthStore } from '@/store/authStore'
 import { PageLoading } from '@/components/common/Loading'
+import { RiskControlBadge } from '@/components/common/RiskControlBadge'
+import { getActiveRiskControlAlerts, type RiskControlAlert } from '@/api/riskControl'
 import type { AccountDetail } from '@/types'
 
 type ModalType = 'qrcode' | 'password' | 'manual' | 'edit' | 'default-reply' | 'ai-settings' | null
@@ -22,6 +24,8 @@ export function Accounts() {
   const [loading, setLoading] = useState(true)
   const [accounts, setAccounts] = useState<AccountWithKeywordCount[]>([])
   const [activeModal, setActiveModal] = useState<ModalType>(null)
+  // 风控告警映射：accountId -> alert
+  const [riskMap, setRiskMap] = useState<Record<string, RiskControlAlert>>({})
   
   // 默认密码检查状态
   const [usingDefaultPassword, setUsingDefaultPassword] = useState(false)
@@ -120,6 +124,15 @@ export function Accounts() {
   useEffect(() => {
     if (!_hasHydrated || !isAuthenticated || !token) return
     loadAccounts()
+    // 加载风控告警
+    const fetchRisk = () => getActiveRiskControlAlerts().then(list => {
+      const map: Record<string, RiskControlAlert> = {}
+      for (const a of list) map[a.cookie_id] = a
+      setRiskMap(map)
+    }).catch(() => {})
+    fetchRisk()
+    const t = setInterval(fetchRisk, 30_000)
+    return () => clearInterval(t)
   }, [_hasHydrated, isAuthenticated, token])
 
   // 单独的 useEffect 检查默认密码
@@ -638,6 +651,8 @@ export function Accounts() {
             <thead>
               <tr>
                 <th>账号ID</th>
+                <th>风控</th>
+                <th>备注</th>
                 <th>关键词</th>
                 <th>状态</th>
                 <th>AI回复</th>
@@ -649,7 +664,7 @@ export function Accounts() {
             <tbody>
               {accounts.length === 0 ? (
                 <tr>
-                  <td colSpan={8}>
+                  <td colSpan={10}>
                     <div className="empty-state py-8">
                       <p className="text-slate-500 dark:text-slate-400">暂无账号，请添加新账号</p>
                     </div>
@@ -659,6 +674,26 @@ export function Accounts() {
                 accounts.map((account) => (
                   <tr key={account.id}>
                     <td className="font-medium text-blue-600 dark:text-blue-400">{account.id}</td>
+                    <td>
+                      {riskMap[account.id] ? (
+                        <RiskControlBadge
+                          alert={riskMap[account.id]}
+                          onClick={(a) => {
+                            // 快速处理：点开后根据建议动作跳转打开对应弹窗
+                            if (a.action === 'qrcode') startQRCodeLogin()
+                            else if (a.action === 'password') handleOpenModal('password')
+                            else addToast({ type: 'warning', message: a.suggestion || '需要人工处理' })
+                          }}
+                        />
+                      ) : (
+                        <span className="text-slate-300 text-xs">-</span>
+                      )}
+                    </td>
+                    <td>
+                      <span className="text-sm text-slate-600 dark:text-slate-300" title={account.note || ''}>
+                        {account.note || <span className="text-slate-400">—</span>}
+                      </span>
+                    </td>
                     <td>
                       <span className="inline-flex items-center gap-1.5 text-sm">
                         <MessageSquare className="w-3.5 h-3.5 text-blue-500" />

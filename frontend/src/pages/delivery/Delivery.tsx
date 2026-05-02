@@ -8,6 +8,8 @@ import { useUIStore } from '@/store/uiStore'
 import { useAuthStore } from '@/store/authStore'
 import { PageLoading } from '@/components/common/Loading'
 import { Select } from '@/components/common/Select'
+import { ItemThumb } from '@/components/common/ItemThumb'
+import { useItemMap } from '@/hooks/useItemMap'
 import type { DeliveryRule } from '@/types'
 
 export function Delivery() {
@@ -16,14 +18,18 @@ export function Delivery() {
   const [loading, setLoading] = useState(true)
   const [rules, setRules] = useState<DeliveryRule[]>([])
   const [cards, setCards] = useState<CardData[]>([])
+  const itemMap = useItemMap(_hasHydrated && isAuthenticated && !!token)
   
   // 弹窗状态
   const [isModalOpen, setIsModalOpen] = useState(false)
   const [editingRule, setEditingRule] = useState<DeliveryRule | null>(null)
   const [formKeyword, setFormKeyword] = useState('')
   const [formCardId, setFormCardId] = useState('')
+  const [formItemId, setFormItemId] = useState('')
   const [formDescription, setFormDescription] = useState('')
   const [formEnabled, setFormEnabled] = useState(true)
+  const [formDeliveryCount, setFormDeliveryCount] = useState(1)
+  const [formBonusTiers, setFormBonusTiers] = useState('')
   const [saving, setSaving] = useState(false)
 
   const loadRules = async () => {
@@ -84,8 +90,11 @@ export function Delivery() {
     setEditingRule(null)
     setFormKeyword('')
     setFormCardId('')
+    setFormItemId('')
     setFormDescription('')
     setFormEnabled(true)
+    setFormDeliveryCount(1)
+    setFormBonusTiers('')
     setIsModalOpen(true)
   }
 
@@ -93,8 +102,11 @@ export function Delivery() {
     setEditingRule(rule)
     setFormKeyword(rule.keyword)
     setFormCardId(String(rule.card_id))
+    setFormItemId(rule.item_id || '')
     setFormDescription(rule.description || '')
     setFormEnabled(rule.enabled)
+    setFormDeliveryCount(Math.max(1, Number(rule.delivery_count) || 1))
+    setFormBonusTiers(rule.bonus_tiers || '')
     setIsModalOpen(true)
   }
 
@@ -105,8 +117,8 @@ export function Delivery() {
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault()
-    if (!formKeyword.trim()) {
-      addToast({ type: 'warning', message: '请输入触发关键词' })
+    if (!formKeyword.trim() && !formItemId.trim()) {
+      addToast({ type: 'warning', message: '触发关键词与商品ID至少要填一个' })
       return
     }
     if (!formCardId) {
@@ -119,9 +131,11 @@ export function Delivery() {
       const data = {
         keyword: formKeyword.trim(),
         card_id: Number(formCardId),
-        delivery_count: 1,  // 固定为1
+        delivery_count: Math.max(1, Math.floor(formDeliveryCount) || 1),
         description: formDescription || undefined,
         enabled: formEnabled,
+        item_id: formItemId.trim() || null,
+        bonus_tiers: formBonusTiers.trim() || null,
       }
 
       if (editingRule) {
@@ -185,8 +199,12 @@ export function Delivery() {
             <thead>
               <tr>
                 <th>触发关键词</th>
+                <th style={{ width: 56 }}>图片</th>
+                <th>商品ID</th>
                 <th>关联卡券</th>
                 <th>规格</th>
+                <th>倍数</th>
+                <th>满赠</th>
                 <th>已发次数</th>
                 <th>状态</th>
                 <th>操作</th>
@@ -195,7 +213,7 @@ export function Delivery() {
             <tbody>
               {rules.length === 0 ? (
                 <tr>
-                  <td colSpan={6} className="text-center py-8 text-gray-500">
+                  <td colSpan={9} className="text-center py-8 text-gray-500">
                     <div className="flex flex-col items-center gap-2">
                       <Truck className="w-12 h-12 text-gray-300" />
                       <p>暂无发货规则</p>
@@ -208,7 +226,24 @@ export function Delivery() {
                   const relatedCard = cards.find(c => c.id === rule.card_id)
                   return (
                     <tr key={rule.id}>
-                      <td className="font-medium text-blue-600 dark:text-blue-400">{rule.keyword}</td>
+                      <td className="font-medium text-blue-600 dark:text-blue-400">
+                        {rule.keyword ? rule.keyword : <span className="text-slate-400 italic">（无，按商品ID触发）</span>}
+                      </td>
+                      <td>
+                        {rule.item_id ? (
+                          <ItemThumb
+                            itemId={rule.item_id}
+                            picUrl={itemMap[String(rule.item_id)]?.pic_url}
+                            itemTitle={itemMap[String(rule.item_id)]?.item_title}
+                            size={40}
+                          />
+                        ) : (
+                          <span className="text-slate-300 text-xs">-</span>
+                        )}
+                      </td>
+                      <td className="text-xs text-slate-600 dark:text-slate-300" title={rule.item_id || '任意商品'}>
+                        {rule.item_id ? rule.item_id : <span className="text-slate-400">任意</span>}
+                      </td>
                       <td className="text-sm">{rule.card_name || `卡券ID: ${rule.card_id}`}</td>
                       <td>
                         {relatedCard?.is_multi_spec ? (
@@ -218,6 +253,16 @@ export function Delivery() {
                         ) : (
                           <span className="text-gray-400">-</span>
                         )}
+                      </td>
+                      <td>
+                        <span className="badge-info">×{rule.delivery_count || 1}</span>
+                      </td>
+                      <td className="text-xs text-slate-600 dark:text-slate-300" title="买X赠Y（按购买数量取最高满足档）">
+                        {rule.bonus_tiers
+                          ? rule.bonus_tiers.split(',').map(t => t.trim()).filter(Boolean).map((t, i) => (
+                              <span key={i} className="badge-warning mr-1">买{t.split(':')[0]}赠{t.split(':')[1]}</span>
+                            ))
+                          : <span className="text-slate-400">-</span>}
                       </td>
                       <td className="text-center text-slate-500">{rule.delivery_times || 0}</td>
                       <td>
@@ -280,14 +325,13 @@ export function Delivery() {
             <form onSubmit={handleSubmit}>
               <div className="modal-body space-y-4">
                 <div>
-                  <label className="input-label">触发关键词 *</label>
+                  <label className="input-label">触发关键词</label>
                   <input
                     type="text"
                     value={formKeyword}
                     onChange={(e) => setFormKeyword(e.target.value)}
                     className="input-ios"
-                    placeholder="输入触发自动发货的关键词"
-                    required
+                    placeholder="与商品ID 二选一：填了关键词则需匹配该词"
                   />
                   <p className="text-xs text-gray-500 mt-1">
                     💡 提示：商品标题中的连续几个字
@@ -309,6 +353,44 @@ export function Delivery() {
                     ]}
                     placeholder="请选择卡券"
                   />
+                </div>
+                <div>
+                  <label className="input-label">商品ID（可选，填写后仅对该商品生效）</label>
+                  <input
+                    type="text"
+                    value={formItemId}
+                    onChange={(e) => setFormItemId(e.target.value)}
+                    className="input-ios"
+                    placeholder="留空则对所有商品生效，填写后按商品ID精准匹配"
+                  />
+                  <p className="text-xs text-gray-500 mt-1">提示：填写后仅该商品ID的订单会使用此规则，优先级高于通用规则</p>
+                </div>
+                <div>
+                  <label className="input-label">发送倍数 / 张数</label>
+                  <input
+                    type="number"
+                    min={1}
+                    step={1}
+                    value={formDeliveryCount}
+                    onChange={(e) => setFormDeliveryCount(Math.max(1, Number(e.target.value) || 1))}
+                    className="input-ios"
+                  />
+                  <p className="text-xs text-gray-500 mt-1">
+                    一次触发发送 N 份内容；用于批量数据卡券（如卡密）每次发 N 条，或文本/图片重复发送 N 次
+                  </p>
+                </div>
+                <div>
+                  <label className="input-label">满赠梯度（可选，买X赠Y）</label>
+                  <input
+                    type="text"
+                    value={formBonusTiers}
+                    onChange={(e) => setFormBonusTiers(e.target.value)}
+                    className="input-ios"
+                    placeholder="如 10:1, 20:2, 50:5"
+                  />
+                  <p className="text-xs text-gray-500 mt-1">
+                    格式：“购买数量:赠送数量”，多档用逗号分隔。例如 <code className="bg-slate-100 dark:bg-slate-800 px-1 rounded">10:1,20:2</code> 表示买满10件赠送1件，买满20件赠送2件。需配合商品开启“多数量发货”使用。
+                  </p>
                 </div>
                 <div>
                   <label className="input-label">描述（可选）</label>

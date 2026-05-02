@@ -421,7 +421,7 @@ export function Keywords() {
                   ? [{ value: '', label: '暂无账号' }]
                   : accounts.map((account) => ({
                       value: account.id,
-                      label: account.id,
+                      label: account.note ? `${account.id} (${account.note})` : account.id,
                     }))
               }
               placeholder="选择账号"

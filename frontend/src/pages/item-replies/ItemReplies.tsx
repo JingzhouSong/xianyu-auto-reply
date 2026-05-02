@@ -4,6 +4,7 @@ import { motion } from 'framer-motion'
 import { MessageCircle, RefreshCw, Plus, Edit2, Trash2, X, Loader2 } from 'lucide-react'
 import { getItemReplies, deleteItemReply, addItemReply, updateItemReply } from '@/api/items'
 import { getAccounts } from '@/api/accounts'
+import { formatAccountId } from '@/utils/accountLabel'
 import { useUIStore } from '@/store/uiStore'
 import { useAuthStore } from '@/store/authStore'
 import { PageLoading } from '@/components/common/Loading'
@@ -173,7 +174,7 @@ export function ItemReplies() {
                 { value: '', label: '所有账号' },
                 ...accounts.map((account) => ({
                   value: account.id,
-                  label: account.id,
+                  label: account.note ? `${account.id} (${account.note})` : account.id,
                 })),
               ]}
               placeholder="选择账号"
@@ -222,7 +223,7 @@ export function ItemReplies() {
               ) : (
                 replies.map((reply) => (
                   <tr key={reply.id}>
-                    <td className="font-medium text-blue-600 dark:text-blue-400">{reply.cookie_id}</td>
+                    <td className="font-medium text-blue-600 dark:text-blue-400 whitespace-nowrap">{formatAccountId(reply.cookie_id, accounts)}</td>
                     <td className="text-sm">{reply.item_id}</td>
                     <td className="max-w-[150px] truncate">{reply.title || '-'}</td>
                     <td className="max-w-[200px] truncate text-gray-500">{reply.reply}</td>

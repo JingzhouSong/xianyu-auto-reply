@@ -243,6 +243,29 @@ strategy_stats = RetryStrategyStats()
 
 class XianyuSliderStealth:
     
+    @staticmethod
+    def _mask_account(account: str) -> str:
+        """脱敏账号，仅用于日志输出。手机号 138****1234；邮箱 ab***@xx.com；其它取首尾各两位。"""
+        try:
+            if not account:
+                return '<empty>'
+            s = str(account)
+            # 邮箱
+            if '@' in s:
+                local, _, domain = s.partition('@')
+                if len(local) <= 2:
+                    return local[:1] + '***@' + domain
+                return local[:2] + '***@' + domain
+            # 纯数字手机号
+            digits = ''.join(ch for ch in s if ch.isdigit())
+            if len(digits) >= 7 and digits == s:
+                return digits[:3] + '*' * (len(digits) - 7) + digits[-4:]
+            if len(s) <= 4:
+                return s[:1] + '***'
+            return s[:2] + '*' * (len(s) - 4) + s[-2:]
+        except Exception:
+            return '<masked>'
+
     def __init__(self, user_id: str = "default", enable_learning: bool = True, headless: bool = True):
         self.user_id = user_id
         self.enable_learning = enable_learning
@@ -1216,19 +1239,120 @@ class XianyuSliderStealth:
         logger.info(f"【{self.pure_user_id}】极速模式：{len(trajectory)}步，超调100%+")
         return trajectory
     
-    def generate_human_trajectory(self, distance: float):
-        """生成人类化滑动轨迹 - 只使用极速物理模型"""
+    def _generate_human_slow_trajectory(self, distance: float, mode: str = 'human'):
+        """生成接近真人手势的滑动轨迹
+
+        真人滑动行为特征（针对阿里云 NC/IC 滑块识别模型）：
+        1. 钟形速度曲线：起步慢 → 中段加速到峰值 → 末段减速
+        2. 步数 35-70（采样率约 60Hz，对应 0.6-1.5s）
+        3. Y 轴使用连续随机游走（非每步独立随机），更接近肌肉抖动
+        4. 中途 1-2 处微停顿（10-30ms），模拟人手迟疑
+        5. 轻度超调 2-6%，平滑回退到目标
+        6. 末端有 1-2 个微调步（fine adjust），模拟"对准位置"
+
+        Args:
+            distance: 目标滑动距离（px）
+            mode: 'human'（中速 ~700-1000ms）或 'human_slow'（慢速 ~1100-1500ms）
+        """
+        if mode == 'human_slow':
+            steps = random.randint(50, 70)
+            total_time = random.uniform(1.1, 1.5)
+            overshoot_ratio = random.uniform(1.02, 1.04)
+        else:
+            steps = random.randint(35, 50)
+            total_time = random.uniform(0.7, 1.0)
+            overshoot_ratio = random.uniform(1.03, 1.06)
+
+        overshoot_distance = distance * overshoot_ratio
+        # 80% 步用于前向到超调点，15% 用于回退，5% 用于末端微调
+        forward_steps = int(steps * random.uniform(0.78, 0.85))
+        back_steps = max(3, int(steps * 0.12))
+        fine_steps = max(2, steps - forward_steps - back_steps)
+
+        trajectory = []
+        avg_delay = total_time / steps
+
+        # ---- 前向阶段：钟形速度（先慢-中加速-末减速）----
+        # 使用 sin(pi*t) 作为速度曲线，对其积分得到位置：
+        #   v(t) = sin(pi * t)，归一化使总位移 = overshoot_distance
+        # 数值积分得到位置序列
+        import math
+        velocities = [math.sin(math.pi * (i + 0.5) / forward_steps) for i in range(forward_steps)]
+        v_sum = sum(velocities)
+        # 累计位移
+        cum = 0.0
+        # Y 轴连续游走起点
+        y_drift = 0.0
+        # 选择 1-2 个微停顿插入位置
+        pause_positions = set()
+        if forward_steps >= 20:
+            n_pauses = random.choice([1, 1, 2])
+            for _ in range(n_pauses):
+                pause_positions.add(random.randint(int(forward_steps * 0.3), int(forward_steps * 0.75)))
+
+        for i in range(forward_steps):
+            cum += velocities[i] / v_sum * overshoot_distance
+            # Y 连续游走（每步 -0.6~0.6 增量），约束在 ±3.5
+            y_drift += random.uniform(-0.6, 0.6)
+            y_drift = max(-3.5, min(3.5, y_drift))
+            # 单步延迟随轨迹位置略变（中段稍快）
+            t_norm = (i + 1) / forward_steps
+            delay_factor = 1.4 - 0.5 * math.sin(math.pi * t_norm)  # 0.9~1.4
+            delay = avg_delay * delay_factor * random.uniform(0.85, 1.15)
+            # 微停顿
+            if i in pause_positions:
+                delay += random.uniform(0.02, 0.05)
+            trajectory.append((cum, y_drift, delay))
+
+        # ---- 回退阶段：从超调点平滑回到目标位置（easeOutQuad 减速）----
+        for i in range(back_steps):
+            t = (i + 1) / back_steps
+            ease_t = self._easing_function(t, mode='easeOutQuad')
+            x = overshoot_distance - (overshoot_distance - distance) * ease_t
+            y_drift += random.uniform(-0.4, 0.4)
+            y_drift = max(-3.5, min(3.5, y_drift))
+            delay = avg_delay * random.uniform(1.1, 1.6)  # 回退更慢
+            trajectory.append((x, y_drift, delay))
+
+        # ---- 末端微调阶段：以 ±0.5px 在目标处微调 1-3 步 ----
+        for i in range(fine_steps):
+            x = distance + random.uniform(-0.6, 0.6)
+            y_drift += random.uniform(-0.3, 0.3)
+            y_drift = max(-3.5, min(3.5, y_drift))
+            delay = avg_delay * random.uniform(1.5, 2.2)
+            trajectory.append((x, y_drift, delay))
+
+        logger.info(
+            f"【{self.pure_user_id}】人化轨迹({mode})：{len(trajectory)}步 "
+            f"(前向{forward_steps}+回退{back_steps}+微调{fine_steps})，"
+            f"超调{(overshoot_ratio-1)*100:.1f}%，预计耗时{total_time:.2f}s"
+        )
+        return trajectory
+
+    def generate_human_trajectory(self, distance: float, strategy: str = 'human'):
+        """生成人类化滑动轨迹
+
+        Args:
+            distance: 滑动距离
+            strategy: 'ultra_fast' | 'human' | 'human_slow'
+        """
         try:
-            # 只使用物理加速度模型（移除贝塞尔模型以提高速度和稳定性）
-            logger.info(f"【{self.pure_user_id}】📐 使用极速物理模型生成轨迹")
-            trajectory = self._generate_physics_trajectory(distance)
+            if strategy == 'human':
+                logger.info(f"【{self.pure_user_id}】📐 使用中速人化轨迹（重试策略）")
+                trajectory = self._generate_human_slow_trajectory(distance, mode='human')
+            elif strategy == 'human_slow':
+                logger.info(f"【{self.pure_user_id}】📐 使用慢速人化轨迹（最终策略）")
+                trajectory = self._generate_human_slow_trajectory(distance, mode='human_slow')
+            else:
+                logger.info(f"【{self.pure_user_id}】📐 使用极速物理模型生成轨迹")
+                trajectory = self._generate_physics_trajectory(distance)
             
             logger.debug(f"【{self.pure_user_id}】极速模式：一次拖到位，无回退")
             
             # 保存轨迹数据
             self.current_trajectory_data = {
                 "distance": distance,
-                "model": "physics_fast",
+                "model": strategy,
                 "total_steps": len(trajectory),
                 "trajectory_points": trajectory.copy(),
                 "final_left_px": 0,
@@ -1345,28 +1469,37 @@ class XianyuSliderStealth:
                     logger.warning(f"【{self.pure_user_id}】🎨 刮刮乐模式：在目标位置停顿{pause_duration:.2f}秒观察...")
                     time.sleep(pause_duration)
                 
+                # 在目标位置短暂停顿（真人放手前的微观察）
+                _strategy = (getattr(self, 'current_trajectory_data', {}) or {}).get('model', 'ultra_fast')
+                if _strategy in ('human', 'human_slow'):
+                    time.sleep(random.uniform(0.08, 0.18))
+                else:
+                    time.sleep(random.uniform(0.02, 0.05))
+
                 # 释放鼠标
-                time.sleep(random.uniform(0.02, 0.05))
                 self.page.mouse.up()
                 time.sleep(random.uniform(0.01, 0.03))
-                
-                # 触发click事件
-                try:
-                    slider_button.evaluate(f"""
-                        (slider) => {{
-                            const event = new MouseEvent('click', {{
-                                bubbles: true,
-                                cancelable: true,
-                                view: window,
-                                clientX: {current_x},
-                                clientY: {current_y},
-                                button: 0
-                            }});
-                            slider.dispatchEvent(event);
-                        }}
-                    """)
-                except Exception as e:
-                    logger.debug(f"【{self.pure_user_id}】触发click事件失败（可忽略）: {e}")
+
+                # 仅 ultra_fast 模式补发一次合成 click 事件（用于触发某些前端校验）
+                # human / human_slow 模式不发，因为真人不会在 mouseup 后再触发 JS 事件，
+                # 这是阿里云 NC 的常用 bot 指纹之一
+                if _strategy == 'ultra_fast':
+                    try:
+                        slider_button.evaluate(f"""
+                            (slider) => {{
+                                const event = new MouseEvent('click', {{
+                                    bubbles: true,
+                                    cancelable: true,
+                                    view: window,
+                                    clientX: {current_x},
+                                    clientY: {current_y},
+                                    button: 0
+                                }});
+                                slider.dispatchEvent(event);
+                            }}
+                        """)
+                    except Exception as e:
+                        logger.debug(f"【{self.pure_user_id}】触发click事件失败（可忽略）: {e}")
                 
                 elapsed_time = time.time() - start_time
                 logger.info(f"【{self.pure_user_id}】滑动完成: 耗时={elapsed_time:.2f}秒, 最终位置=({current_x:.1f}, {current_y:.1f})")
@@ -1744,13 +1877,22 @@ class XianyuSliderStealth:
                 logger.error(f"【{self.pure_user_id}】未找到任何滑块按钮（主页面和所有frame都已检查，包括宽松模式）")
                 return slider_container, None, None
             
-            # 定义滑块轨道选择器
+            # 定义滑块轨道选择器（按出现频率排序）
             track_selectors = [
                 "#nc_1_n1t",
                 ".nc_scale",
                 ".nc_1_n1t",
+                "#nc_1__scale_text",
+                ".nc-lang-cnt",
+                ".nc_1_wrapper .nc_scale",
+                ".btn_slide ~ *",
+                ".nc-container .scale",
+                "[class*='nc_scale']",
                 "[class*='track']",
-                "[class*='scale']"
+                "[class*='scale']",
+                "[class*='slider'][class*='bar']",
+                "[class*='slider'][class*='track']",
+                "[id^='nc_'][id$='_n1t']",
             ]
             
             # 查找滑块轨道（在找到按钮的同一个frame中查找，因为按钮和轨道应该在同一个位置）
@@ -1868,8 +2010,77 @@ class XianyuSliderStealth:
                     except:
                         continue
             
+            # 兜底1：从按钮元素向上寻找轨道（按钮通常嵌在轨道容器内或为其兄弟节点）
+            if not slider_track and slider_button is not None:
+                try:
+                    derived_handle = slider_button.evaluate_handle(
+                        """el => {
+                            // 优先：父元素中查找已知 class
+                            const TRACK_CLASS_RE = /(nc_scale|nc_1_n1t|track|scale|slider[_-]?(bar|track))/i;
+                            let cur = el;
+                            for (let i = 0; i < 6 && cur && cur.parentElement; i++) {
+                                const p = cur.parentElement;
+                                // 在父级中找符合的兄弟节点
+                                for (const sib of p.children) {
+                                    if (sib === el) continue;
+                                    const cls = (sib.className || '') + '';
+                                    const id = (sib.id || '') + '';
+                                    if (TRACK_CLASS_RE.test(cls) || /n1t|scale/i.test(id)) {
+                                        return sib;
+                                    }
+                                }
+                                // 父级本身像轨道
+                                const pcls = (p.className || '') + '';
+                                if (TRACK_CLASS_RE.test(pcls)) return p;
+                                cur = p;
+                            }
+                            // 退而求其次：使用按钮的直接父元素作为轨道（视觉上多数情况成立）
+                            return el.parentElement || null;
+                        }"""
+                    )
+                    el_obj = derived_handle.as_element() if derived_handle else None
+                    if el_obj:
+                        try:
+                            visible = el_obj.is_visible()
+                        except Exception:
+                            visible = True
+                        if visible:
+                            logger.info(f"【{self.pure_user_id}】兜底：通过按钮上下文派生出滑块轨道")
+                            slider_track = el_obj
+                except Exception as _e:
+                    logger.debug(f"【{self.pure_user_id}】派生轨道失败：{_e}")
+
             if not slider_track:
                 logger.error(f"【{self.pure_user_id}】未找到任何滑块轨道（主页面和所有frame都已检查）")
+                # 失败诊断：保存页面 HTML + 截图，便于定位真实选择器
+                try:
+                    import os, time as _time
+                    debug_dir = os.path.join('data', 'slider_debug')
+                    os.makedirs(debug_dir, exist_ok=True)
+                    ts = _time.strftime('%Y%m%d_%H%M%S')
+                    base = os.path.join(debug_dir, f"track_miss_{self.pure_user_id}_{ts}")
+                    try:
+                        self.page.screenshot(path=base + '.png', full_page=True)
+                    except Exception:
+                        pass
+                    try:
+                        with open(base + '.html', 'w', encoding='utf-8') as _f:
+                            _f.write(self.page.content() or '')
+                    except Exception:
+                        pass
+                    # 同时把所有 frame 的 HTML 也存下来
+                    try:
+                        for idx, fr in enumerate(self.page.frames):
+                            try:
+                                with open(base + f'.frame{idx}.html', 'w', encoding='utf-8') as _f:
+                                    _f.write(fr.content() or '')
+                            except Exception:
+                                continue
+                    except Exception:
+                        pass
+                    logger.warning(f"【{self.pure_user_id}】已保存诊断文件：{base}.png/.html (含各 frame)")
+                except Exception as _e:
+                    logger.debug(f"【{self.pure_user_id}】保存滑块诊断文件失败：{_e}")
                 return slider_container, slider_button, None
             
             # 保存找到滑块的frame引用，供后续验证使用
@@ -2233,15 +2444,27 @@ class XianyuSliderStealth:
             fast_mode: 快速查找模式（当已确认滑块存在时使用，减少等待时间）
         """
         failure_records = []
-        current_strategy = 'ultra_fast'  # 极速策略
+        # 策略阶梯：全部使用人化轨迹，追求高通过率
+        # 第1次中速人化（快但像真人）→ 第2次慢速人化 → 第3次更慢
+        # 不再使用 ultra_fast（极速）模式，避免被阿里云 NC 标记为机器人
+        strategy_ladder = ['human', 'human_slow', 'human_slow']
+        current_strategy = strategy_ladder[0]
         
         for attempt in range(1, max_retries + 1):
             try:
-                logger.info(f"【{self.pure_user_id}】开始处理滑块验证... (第{attempt}/{max_retries}次尝试)")
+                # 选择本次尝试的策略
+                current_strategy = strategy_ladder[min(attempt - 1, len(strategy_ladder) - 1)]
+                _acct_tag = getattr(self, '_login_account_masked', None)
+                _acct_suffix = f" ｜ 当前账号（脱敏）: {_acct_tag}" if _acct_tag else ""
+                logger.info(f"【{self.pure_user_id}】开始处理滑块验证... (第{attempt}/{max_retries}次尝试，策略: {current_strategy}){_acct_suffix}")
                 
                 # 如果不是第一次尝试，短暂等待后重试
                 if attempt > 1:
-                    retry_delay = random.uniform(0.5, 1.0)  # 减少等待时间
+                    # 使用人化策略时，重试间隔更长，避免被识别为机器人连续点击
+                    if current_strategy in ('human', 'human_slow'):
+                        retry_delay = random.uniform(1.5, 3.0)
+                    else:
+                        retry_delay = random.uniform(0.5, 1.0)
                     logger.info(f"【{self.pure_user_id}】等待{retry_delay:.2f}秒后重试...")
                     time.sleep(retry_delay)
                     
@@ -2265,8 +2488,8 @@ class XianyuSliderStealth:
                     logger.error(f"【{self.pure_user_id}】滑动距离计算失败")
                     continue
                 
-                # 3. 生成人类化轨迹
-                trajectory = self.generate_human_trajectory(slide_distance)
+                # 3. 生成人类化轨迹（按当前策略）
+                trajectory = self.generate_human_trajectory(slide_distance, strategy=current_strategy)
                 if not trajectory:
                     logger.error(f"【{self.pure_user_id}】轨迹生成失败")
                     continue
@@ -2942,8 +3165,9 @@ class XianyuSliderStealth:
                 return None
             
             browser_mode = "有头" if show_browser else "无头"
+            self._login_account_masked = self._mask_account(account)
             logger.info(f"【{self.pure_user_id}】开始{browser_mode}模式密码登录流程（使用Playwright）...")
-            logger.info(f"【{self.pure_user_id}】账号: {account}")
+            logger.info(f"【{self.pure_user_id}】账号（脱敏）: {self._login_account_masked}")
             logger.info("=" * 60)
             
             # 启动浏览器（使用持久化上下文）
@@ -3317,14 +3541,14 @@ class XianyuSliderStealth:
                     logger.warning(f"【{self.pure_user_id}】查找密码登录标签失败: {e}")
                 
                 # 输入账号
-                logger.info(f"【{self.pure_user_id}】输入账号: {account}")
+                logger.info(f"【{self.pure_user_id}】输入账号（脱敏）: {self._mask_account(account)}")
                 time.sleep(1)
                 
                 account_input = login_frame.query_selector('#fm-login-id')
                 if account_input:
                     logger.info(f"【{self.pure_user_id}】✓ 找到账号输入框")
                     account_input.fill(account)
-                    logger.info(f"【{self.pure_user_id}】✓ 账号已输入")
+                    logger.info(f"【{self.pure_user_id}】✓ 账号已输入（脱敏）: {self._mask_account(account)}")
                     time.sleep(random.uniform(0.5, 1.0))
                 else:
                     logger.error(f"【{self.pure_user_id}】✗ 未找到账号输入框")

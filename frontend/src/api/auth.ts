@@ -7,7 +7,7 @@ export const login = (data: LoginRequest): Promise<LoginResponse> => {
 }
 
 // 验证 Token
-export const verifyToken = (): Promise<{ authenticated: boolean; user_id?: number; username?: string; is_admin?: boolean }> => {
+export const verifyToken = (): Promise<{ authenticated: boolean; user_id?: number; username?: string; is_admin?: boolean; expires_at?: number | null; expired?: boolean; message?: string }> => {
   return get('/verify')
 }
 

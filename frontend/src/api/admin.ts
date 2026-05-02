@@ -12,6 +12,9 @@ export const getUsers = async (): Promise<{ success: boolean; data?: User[] }> =
     is_admin: boolean
     cookie_count?: number
     card_count?: number
+    expires_at?: number | null
+    register_ip?: string | null
+    created_at?: string
   }> }>('/admin/users')
   // 后端返回 { users: [...] } 格式，转换字段名
   const users: User[] = (result.users || []).map(u => ({
@@ -19,8 +22,48 @@ export const getUsers = async (): Promise<{ success: boolean; data?: User[] }> =
     username: u.username,
     email: u.email,
     is_admin: u.is_admin,
+    expires_at: u.expires_at ?? null,
+    register_ip: u.register_ip ?? null,
+    created_at: u.created_at,
   }))
   return { success: true, data: users }
+}
+
+// ========== 会员到期管理 ==========
+
+// 续期：在当前到期基础上延长 N 天
+export const extendUserExpiry = (userId: number, days: number): Promise<{ success: boolean; expires_at?: number; days_added?: number }> => {
+  return post(`/admin/users/${userId}/extend`, { days })
+}
+
+// 直接设置到期时间（null 表示永久）
+export const setUserExpiry = (userId: number, expiresAt: number | null): Promise<{ success: boolean; expires_at?: number | null }> => {
+  return post(`/admin/users/${userId}/expiry`, { expires_at: expiresAt })
+}
+
+// ========== 会员订阅档位 ==========
+
+export interface EntitlementPrice {
+  key: string
+  name: string
+  days: number
+  price: number
+  enabled: boolean
+  sort_order: number
+  updated_at?: string
+}
+
+export const getEntitlementPrices = async (): Promise<EntitlementPrice[]> => {
+  const r = await get<{ items: EntitlementPrice[] }>('/entitlement-prices')
+  return r.items || []
+}
+
+export const upsertEntitlementPrice = (data: EntitlementPrice): Promise<ApiResponse> => {
+  return post('/admin/entitlement-prices', data)
+}
+
+export const deleteEntitlementPrice = (key: string): Promise<ApiResponse> => {
+  return del(`/admin/entitlement-prices/${encodeURIComponent(key)}`)
 }
 
 // TODO: 后端暂未实现 POST /admin/users 接口

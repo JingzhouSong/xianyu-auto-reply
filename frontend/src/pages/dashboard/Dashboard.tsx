@@ -8,6 +8,9 @@ import { type AdminStats, getAdminStats } from '@/api/admin'
 import { useUIStore } from '@/store/uiStore'
 import { useAuthStore } from '@/store/authStore'
 import { PageLoading } from '@/components/common/Loading'
+import { DashboardRiskControlPanel } from '@/components/common/RiskControlBadge'
+import { getActiveRiskControlAlerts, type RiskControlAlert } from '@/api/riskControl'
+import { useNavigate } from 'react-router-dom'
 import type { AccountDetail } from '@/types'
 
 interface DashboardStats {
@@ -30,6 +33,8 @@ export function Dashboard() {
   })
   const [accounts, setAccounts] = useState<AccountDetail[]>([])
   const [adminStats, setAdminStats] = useState<AdminStats | null>(null)
+  const [riskAlerts, setRiskAlerts] = useState<RiskControlAlert[]>([])
+  const navigate = useNavigate()
 
   const loadDashboard = async () => {
     if (!_hasHydrated || !isAuthenticated || !token) return
@@ -108,6 +113,12 @@ export function Dashboard() {
   useEffect(() => {
     if (!_hasHydrated || !isAuthenticated || !token) return
     loadDashboard()
+    // 戳取风控告警
+    getActiveRiskControlAlerts().then(setRiskAlerts).catch(() => setRiskAlerts([]))
+    const t = setInterval(() => {
+      getActiveRiskControlAlerts().then(setRiskAlerts).catch(() => {})
+    }, 30_000) // 30s 轮询
+    return () => clearInterval(t)
   }, [_hasHydrated, isAuthenticated, token])
 
   if (loading) {
@@ -150,6 +161,12 @@ export function Dashboard() {
 
   return (
     <div className="space-y-3 sm:space-y-4">
+      {/* 风控告警面板 */}
+      <DashboardRiskControlPanel
+        alerts={riskAlerts}
+        onResolve={(alert) => navigate(`/accounts?focus=${encodeURIComponent(alert.cookie_id)}`)}
+      />
+
       {/* Page header */}
       <div className="page-header flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3 sm:gap-4">
         <div>
@@ -247,6 +264,7 @@ export function Dashboard() {
             <thead>
               <tr>
                 <th>账号ID</th>
+                <th>备注</th>
                 <th>关键词数量</th>
                 <th>状态</th>
                 <th>最后更新</th>
@@ -255,7 +273,7 @@ export function Dashboard() {
             <tbody>
               {accounts.length === 0 ? (
                 <tr>
-                  <td colSpan={4}>
+                  <td colSpan={5}>
                     <div className="empty-state py-8">
                       <Users className="empty-state-icon" />
                       <p className="text-gray-500">暂无账号数据</p>
@@ -270,6 +288,7 @@ export function Dashboard() {
                   return (
                     <tr key={account.id}>
                       <td className="font-medium text-blue-600 dark:text-blue-400">{account.id}</td>
+                      <td className="text-slate-600 dark:text-slate-300">{account.note || <span className="text-slate-400">—</span>}</td>
                       <td>{keywordCount}</td>
                       <td>
                         {(() => {

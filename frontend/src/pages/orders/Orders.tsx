@@ -3,10 +3,13 @@ import { motion } from 'framer-motion'
 import { ShoppingCart, RefreshCw, Search, Trash2, Eye, X, ChevronLeft, ChevronRight } from 'lucide-react'
 import { getOrders, deleteOrder, getOrderDetail, type OrderDetail } from '@/api/orders'
 import { getAccounts } from '@/api/accounts'
+import { formatAccountId } from '@/utils/accountLabel'
 import { useUIStore } from '@/store/uiStore'
 import { useAuthStore } from '@/store/authStore'
 import { PageLoading } from '@/components/common/Loading'
 import { Select } from '@/components/common/Select'
+import { ItemThumb } from '@/components/common/ItemThumb'
+import { useItemMap } from '@/hooks/useItemMap'
 import type { Order, Account } from '@/types'
 
 const statusMap: Record<string, { label: string; class: string }> = {
@@ -38,6 +41,7 @@ export function Orders() {
   const [pageSize] = useState(20)
   const [total, setTotal] = useState(0)
   const [totalPages, setTotalPages] = useState(0)
+  const itemMap = useItemMap(_hasHydrated && isAuthenticated && !!token)
 
   const loadOrders = async (page: number = currentPage) => {
     if (!_hasHydrated || !isAuthenticated || !token) return
@@ -158,7 +162,7 @@ export function Orders() {
                   { value: '', label: '所有账号' },
                   ...accounts.map((account) => ({
                     value: account.id,
-                    label: account.id,
+                    label: account.note ? `${account.id} (${account.note})` : account.id,
                   })),
                 ]}
                 placeholder="所有账号"
@@ -217,6 +221,7 @@ export function Orders() {
             <thead>
               <tr>
                 <th>订单ID</th>
+                <th style={{ width: 56 }}>图片</th>
                 <th>商品ID</th>
                 <th>买家ID</th>
                 <th>数量</th>
@@ -231,7 +236,7 @@ export function Orders() {
             <tbody>
               {filteredOrders.length === 0 ? (
                 <tr>
-                  <td colSpan={10} className="text-center py-8 text-gray-500">
+                  <td colSpan={11} className="text-center py-8 text-gray-500">
                     <div className="flex flex-col items-center gap-2">
                       <ShoppingCart className="w-12 h-12 text-gray-300" />
                       <p>暂无订单数据</p>
@@ -244,10 +249,22 @@ export function Orders() {
                   return (
                     <tr key={order.id}>
                       <td className="font-mono text-sm">{order.order_id}</td>
+                      <td>
+                        <ItemThumb
+                          itemId={order.item_id}
+                          picUrl={order.pic_url || itemMap[String(order.item_id || '')]?.pic_url}
+                          itemTitle={order.item_title || itemMap[String(order.item_id || '')]?.item_title}
+                          size={40}
+                        />
+                      </td>
                       <td className="text-sm">{order.item_id}</td>
                       <td className="text-sm">{order.buyer_id}</td>
                       <td>{order.quantity}</td>
-                      <td className="text-amber-600 font-medium">¥{order.amount}</td>
+                      <td className="text-amber-600 font-medium whitespace-nowrap">
+                        {order.amount && String(order.amount).trim()
+                          ? <>¥{order.amount}</>
+                          : <span className="text-slate-300">-</span>}
+                      </td>
                       <td>
                         <span className={status.class}>{status.label}</span>
                       </td>
@@ -258,7 +275,7 @@ export function Orders() {
                           <span className="badge-gray">否</span>
                         )}
                       </td>
-                      <td className="font-medium text-blue-600 dark:text-blue-400">{order.cookie_id}</td>
+                      <td className="font-medium text-blue-600 dark:text-blue-400 whitespace-nowrap">{formatAccountId(order.cookie_id, accounts)}</td>
                       <td className="text-sm text-gray-500">
                         {order.created_at ? new Date(order.created_at).toLocaleString('zh-CN') : '-'}
                       </td>
@@ -365,6 +382,23 @@ export function Orders() {
                 </div>
               ) : orderDetail ? (
                 <div className="space-y-4">
+                  {/* 商品图与标题 */}
+                  {orderDetail.item_id && (
+                    <div className="flex items-center gap-3 p-3 rounded-lg bg-slate-50 dark:bg-slate-800/40">
+                      <ItemThumb
+                        itemId={orderDetail.item_id}
+                        picUrl={orderDetail.pic_url || itemMap[String(orderDetail.item_id)]?.pic_url}
+                        itemTitle={orderDetail.item_title || itemMap[String(orderDetail.item_id)]?.item_title}
+                        size={64}
+                      />
+                      <div className="flex-1 min-w-0">
+                        <div className="text-sm font-medium text-slate-700 dark:text-slate-200 truncate">
+                          {orderDetail.item_title || itemMap[String(orderDetail.item_id)]?.item_title || '（无商品标题信息）'}
+                        </div>
+                        <div className="text-xs text-slate-400 mt-1 font-mono">{orderDetail.item_id}</div>
+                      </div>
+                    </div>
+                  )}
                   {/* 基本信息 */}
                   <div>
                     <h3 className="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">基本信息</h3>
@@ -383,7 +417,7 @@ export function Orders() {
                       </div>
                       <div className="flex justify-between py-1 border-b border-gray-100 dark:border-gray-700">
                         <span className="text-gray-500">账号ID</span>
-                        <span className="text-blue-600">{orderDetail.cookie_id || '未知'}</span>
+                        <span className="text-blue-600">{orderDetail.cookie_id ? formatAccountId(orderDetail.cookie_id, accounts) : '未知'}</span>
                       </div>
                       <div className="flex justify-between py-1 border-b border-gray-100 dark:border-gray-700">
                         <span className="text-gray-500">订单状态</span>

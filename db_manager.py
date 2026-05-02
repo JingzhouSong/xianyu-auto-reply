@@ -79,7 +79,63 @@ class DBManager:
                 password_hash TEXT NOT NULL,
                 is_active BOOLEAN DEFAULT TRUE,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                expires_at REAL,
+                register_ip TEXT
+            )
+            ''')
+
+            # 兼容旧库：补齐 expires_at / register_ip 列（会员体系）
+            try:
+                cursor.execute("PRAGMA table_info(users)")
+                _ucols = [r[1] for r in cursor.fetchall()]
+                if 'expires_at' not in _ucols:
+                    self._execute_sql(cursor, "ALTER TABLE users ADD COLUMN expires_at REAL")
+                    logger.info("users 表新增 expires_at 列")
+                if 'register_ip' not in _ucols:
+                    self._execute_sql(cursor, "ALTER TABLE users ADD COLUMN register_ip TEXT")
+                    self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_users_register_ip ON users(register_ip)")
+                    logger.info("users 表新增 register_ip 列")
+            except Exception as _e:
+                logger.error(f"users 表迁移失败: {_e}")
+
+            # 权益价格配置表（周/月/年卡及任意自定义档位）
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS entitlement_prices (
+                key TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                days INTEGER NOT NULL,
+                price REAL NOT NULL DEFAULT 0,
+                enabled BOOLEAN DEFAULT TRUE,
+                sort_order INTEGER DEFAULT 0,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            ''')
+            # 种子数据（仅当表为空时插入）
+            try:
+                self._execute_sql(cursor, "SELECT COUNT(*) FROM entitlement_prices")
+                if (cursor.fetchone() or [0])[0] == 0:
+                    cursor.executemany(
+                        "INSERT INTO entitlement_prices (key, name, days, price, enabled, sort_order) VALUES (?, ?, ?, ?, ?, ?)",
+                        [
+                            ('weekly',  '周卡', 7,   9.9,  1, 1),
+                            ('monthly', '月卡', 30,  29.9, 1, 2),
+                            ('yearly',  '年卡', 365, 299,  1, 3),
+                        ],
+                    )
+                    self.conn.commit()
+                    logger.info("已写入权益价格默认数据：周/月/年卡")
+            except Exception as _e:
+                logger.error(f"entitlement_prices 种子数据写入失败: {_e}")
+
+            # 会话 token 持久化表（重启后保留登录态）
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS session_tokens (
+                token TEXT PRIMARY KEY,
+                user_id INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                is_admin BOOLEAN DEFAULT FALSE,
+                timestamp REAL NOT NULL
             )
             ''')
 
@@ -198,7 +254,7 @@ class DBManager:
             CREATE TABLE IF NOT EXISTS cards (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL,
-                type TEXT NOT NULL CHECK (type IN ('api', 'text', 'data', 'image')),
+                type TEXT NOT NULL CHECK (type IN ('api', 'text', 'data', 'image', 'cred')),
                 api_config TEXT,
                 text_content TEXT,
                 data_content TEXT,
@@ -215,6 +271,28 @@ class DBManager:
                 FOREIGN KEY (user_id) REFERENCES users (id)
             )
             ''')
+
+            # 卡券消费记录表（每次"批量数据"卡券被消费一行就写一条；用于售后查看 + 恢复未售）
+            cursor.execute('''
+            CREATE TABLE IF NOT EXISTS card_consumption_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                card_id INTEGER NOT NULL,
+                card_name TEXT,
+                content TEXT NOT NULL,
+                rule_id INTEGER,
+                order_id TEXT,
+                buyer_id TEXT,
+                cookie_id TEXT,
+                item_id TEXT,
+                user_id INTEGER,
+                restored INTEGER DEFAULT 0,
+                restored_at TIMESTAMP,
+                consumed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+            ''')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_ccl_card_id ON card_consumption_log(card_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_ccl_user_id ON card_consumption_log(user_id)')
+            cursor.execute('CREATE INDEX IF NOT EXISTS idx_ccl_consumed_at ON card_consumption_log(consumed_at DESC)')
 
             # 创建订单表
             cursor.execute('''
@@ -300,6 +378,36 @@ class DBManager:
                 self._execute_sql(cursor, "ALTER TABLE item_info ADD COLUMN multi_quantity_delivery BOOLEAN DEFAULT FALSE")
                 logger.info("item_info 表 multi_quantity_delivery 列添加完成")
 
+            # 检查并添加 publish_time 列（闲鱼上商品的发布时间，毫秒时间戳）
+            _publish_time_just_added = False
+            try:
+                self._execute_sql(cursor, "SELECT publish_time FROM item_info LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("正在为 item_info 表添加 publish_time 列...")
+                self._execute_sql(cursor, "ALTER TABLE item_info ADD COLUMN publish_time INTEGER")
+                self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_item_publish_time ON item_info(publish_time DESC)")
+                _publish_time_just_added = True
+                logger.info("item_info 表 publish_time 列添加完成")
+
+            # 一次性回填：为已有 item_detail 但 publish_time 为空的旧数据补值
+            try:
+                self._execute_sql(cursor,
+                    "SELECT id, item_detail FROM item_info WHERE publish_time IS NULL AND item_detail IS NOT NULL AND item_detail != ''")
+                rows = cursor.fetchall()
+                if rows:
+                    logger.info(f"开始回填 {len(rows)} 条 item_info.publish_time …")
+                    updates = []
+                    for rid, detail in rows:
+                        ts = self._extract_publish_time_ms(detail)
+                        if ts:
+                            updates.append((ts, rid))
+                    if updates:
+                        cursor.executemany("UPDATE item_info SET publish_time = ? WHERE id = ?", updates)
+                        self.conn.commit()
+                        logger.info(f"已回填 {len(updates)} 条商品发布时间")
+            except Exception as _e:
+                logger.warning(f"回填 publish_time 失败（不影响功能）: {_e}")
+
             # 创建自动发货规则表
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS delivery_rules (
@@ -310,11 +418,29 @@ class DBManager:
                 enabled BOOLEAN DEFAULT TRUE,
                 description TEXT,
                 delivery_times INTEGER DEFAULT 0,
+                item_id TEXT,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                 FOREIGN KEY (card_id) REFERENCES cards(id) ON DELETE CASCADE
             )
             ''')
+
+            # 兼容旧库：为 delivery_rules 添加 item_id 列（按商品ID精确匹配）
+            try:
+                self._execute_sql(cursor, "SELECT item_id FROM delivery_rules LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("正在为 delivery_rules 表添加 item_id 列...")
+                self._execute_sql(cursor, "ALTER TABLE delivery_rules ADD COLUMN item_id TEXT")
+                self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_delivery_rules_item_id ON delivery_rules(item_id)")
+                logger.info("delivery_rules 表 item_id 列添加完成")
+
+            # 兼容旧库：为 delivery_rules 添加 bonus_tiers 列（满赠梯度，例如 "10:1,20:2"）
+            try:
+                self._execute_sql(cursor, "SELECT bonus_tiers FROM delivery_rules LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("正在为 delivery_rules 表添加 bonus_tiers 列...")
+                self._execute_sql(cursor, "ALTER TABLE delivery_rules ADD COLUMN bonus_tiers TEXT")
+                logger.info("delivery_rules 表 bonus_tiers 列添加完成")
 
             # 创建默认回复表（支持账号级别和商品级别）
             cursor.execute('''
@@ -509,6 +635,33 @@ class DBManager:
                 cursor.execute("ALTER TABLE cards ADD COLUMN image_url TEXT")
                 logger.info("数据库迁移完成：添加image_url列")
 
+            # 新增字段：成本价 / 管理员备注（仅后台可见） / 排序
+            if 'cost_price' not in columns:
+                logger.info("添加cards表的cost_price列...")
+                cursor.execute("ALTER TABLE cards ADD COLUMN cost_price REAL")
+            if 'admin_note' not in columns:
+                logger.info("添加cards表的admin_note列...")
+                cursor.execute("ALTER TABLE cards ADD COLUMN admin_note TEXT")
+            if 'sort_order' not in columns:
+                logger.info("添加cards表的sort_order列...")
+                cursor.execute("ALTER TABLE cards ADD COLUMN sort_order INTEGER DEFAULT 0")
+                # 为已有记录按 id 设一个稳定排序种子
+                try:
+                    cursor.execute("UPDATE cards SET sort_order = id WHERE sort_order IS NULL OR sort_order = 0")
+                except Exception:
+                    pass
+
+            # 为 card_consumption_log 添加 sold_price 列（售卖时的订单金额快照）
+            try:
+                self._execute_sql(cursor, "SELECT sold_price FROM card_consumption_log LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("添加 card_consumption_log.sold_price 列...")
+                try:
+                    cursor.execute("ALTER TABLE card_consumption_log ADD COLUMN sold_price TEXT")
+                except Exception as _e:
+                    # 旧版本可能还没建 card_consumption_log 表，忽略
+                    logger.debug(f"card_consumption_log.sold_price 迁移跳过: {_e}")
+
             # 检查并更新CHECK约束（重建表以支持image类型）
             self._update_cards_table_constraints(cursor)
 
@@ -533,73 +686,71 @@ class DBManager:
             pass
 
     def _update_cards_table_constraints(self, cursor):
-        """更新cards表的CHECK约束以支持image类型"""
+        """更新 cards 表的 CHECK 约束以支持 image / cred 类型。
+
+        老代码使用"建新表 → 复制 → 删旧表 → 重命名"的方式重建，但若上一次执行半路失败，
+        cards_new 会残留导致 IF NOT EXISTS 跳过创建，进而后续 INSERT 因主键冲突而失败，
+        于是迁移就被静默跳过——这是用户看到 "CHECK constraint failed: type IN ('api','text','data','image')" 的根因。
+
+        现改为：直接通过 PRAGMA writable_schema 修改 sqlite_master 中的 CHECK 子句，
+        不需要重建表。修改完成后写一条与 schema 相关的 DDL 让 SQLite 重新解析 schema。"""
         try:
-            # 尝试插入一个测试的image类型记录来检查约束
-            cursor.execute('''
-                INSERT INTO cards (name, type, user_id)
-                VALUES ('__test_image_constraint__', 'image', 1)
-            ''')
-            # 如果插入成功，立即删除测试记录
-            cursor.execute("DELETE FROM cards WHERE name = '__test_image_constraint__'")
-            logger.info("cards表约束检查通过，支持image类型")
+            cursor.execute("SELECT sql FROM sqlite_master WHERE type='table' AND name='cards'")
+            row = cursor.fetchone()
+            if not row:
+                return
+            current_sql = row[0] or ''
+            if "'cred'" in current_sql and "'image'" in current_sql:
+                logger.debug("cards 表 CHECK 已含 image+cred，跳过迁移")
+                return
+
+            import re as _re
+            target_check = "CHECK (type IN ('api', 'text', 'data', 'image', 'cred'))"
+            new_sql = _re.sub(
+                r"CHECK\s*\(\s*type\s+IN\s*\([^)]*\)\s*\)",
+                target_check,
+                current_sql,
+                count=1,
+            )
+            if new_sql == current_sql:
+                # 找不到 CHECK 子句，可能此表本来就没约束，直接当成已经满足
+                logger.warning("cards 表未发现 CHECK(type IN (...)) 子句，跳过 CHECK 迁移")
+                return
+
+            # 清理可能残留的旧迁移临时表
+            try:
+                cursor.execute("DROP TABLE IF EXISTS cards_new")
+            except Exception:
+                pass
+
+            logger.info("正在通过 writable_schema 更新 cards 表 CHECK 约束 → 含 image+cred …")
+            cursor.execute("PRAGMA writable_schema = ON")
+            cursor.execute("UPDATE sqlite_master SET sql = ? WHERE type='table' AND name='cards'", (new_sql,))
+            # 关闭可写 schema，并立即提交
+            cursor.execute("PRAGMA writable_schema = RESET")
+            self.conn.commit()
+
+            # 让 SQLite 用新 schema 重新解析（连接级别）
+            try:
+                cursor.execute("PRAGMA integrity_check")
+                _ = cursor.fetchone()
+            except Exception:
+                pass
+
+            # 自检：再尝试插入一条 cred 测试行确认约束已生效
+            try:
+                cursor.execute(
+                    "INSERT INTO cards (name, type, user_id) VALUES ('__test_cred_constraint__', 'cred', 1)"
+                )
+                cursor.execute("DELETE FROM cards WHERE name = '__test_cred_constraint__'")
+                self.conn.commit()
+                logger.info("cards 表 CHECK 约束更新成功，已支持 cred 类型")
+            except Exception as e:
+                # writable_schema 在某些 SQLite 版本下要求重新打开连接才能生效，
+                # 这里再打印警告但不阻塞业务（下一次启动会自然生效）。
+                logger.warning(f"cards 表 CHECK 自检未通过（可能需要重启进程）：{e}")
         except Exception as e:
-            if "CHECK constraint failed" in str(e) or "constraint" in str(e).lower():
-                logger.info("检测到旧的CHECK约束，开始更新cards表...")
-
-                # 重建表以更新约束
-                try:
-                    # 1. 创建新表
-                    cursor.execute('''
-                    CREATE TABLE IF NOT EXISTS cards_new (
-                        id INTEGER PRIMARY KEY AUTOINCREMENT,
-                        name TEXT NOT NULL,
-                        type TEXT NOT NULL CHECK (type IN ('api', 'text', 'data', 'image')),
-                        api_config TEXT,
-                        text_content TEXT,
-                        data_content TEXT,
-                        image_url TEXT,
-                        description TEXT,
-                        enabled BOOLEAN DEFAULT TRUE,
-                        delay_seconds INTEGER DEFAULT 0,
-                        is_multi_spec BOOLEAN DEFAULT FALSE,
-                        spec_name TEXT,
-                        spec_value TEXT,
-                        user_id INTEGER NOT NULL DEFAULT 1,
-                        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-                        FOREIGN KEY (user_id) REFERENCES users (id)
-                    )
-                    ''')
-
-                    # 2. 复制数据
-                    cursor.execute('''
-                    INSERT INTO cards_new (id, name, type, api_config, text_content, data_content, image_url,
-                                          description, enabled, delay_seconds, is_multi_spec, spec_name, spec_value,
-                                          user_id, created_at, updated_at)
-                    SELECT id, name, type, api_config, text_content, data_content, image_url,
-                           description, enabled, delay_seconds, is_multi_spec, spec_name, spec_value,
-                           user_id, created_at, updated_at
-                    FROM cards
-                    ''')
-
-                    # 3. 删除旧表
-                    cursor.execute("DROP TABLE cards")
-
-                    # 4. 重命名新表
-                    cursor.execute("ALTER TABLE cards_new RENAME TO cards")
-
-                    logger.info("cards表约束更新完成，现在支持image类型")
-
-                except Exception as rebuild_error:
-                    logger.error(f"重建cards表失败: {rebuild_error}")
-                    # 如果重建失败，尝试回滚
-                    try:
-                        cursor.execute("DROP TABLE IF EXISTS cards_new")
-                    except:
-                        pass
-            else:
-                logger.error(f"检查cards表约束时出现未知错误: {e}")
+            logger.error(f"更新 cards 表 CHECK 约束失败: {e}")
             
     def check_and_upgrade_db(self, cursor):
         """检查数据库版本并执行必要的升级"""
@@ -2619,20 +2770,26 @@ class DBManager:
 
     # ==================== 用户管理方法 ====================
 
-    def create_user(self, username: str, email: str, password: str) -> bool:
-        """创建新用户"""
+    def create_user(self, username: str, email: str, password: str,
+                    register_ip: Optional[str] = None,
+                    expires_at: Optional[float] = None) -> bool:
+        """创建新用户
+
+        :param register_ip: 注册时真实 IP（用于体验权益的同 IP 计数）
+        :param expires_at: 账号到期时间戳（None 表示永久，主要给管理员用）
+        """
         with self.lock:
             try:
                 cursor = self.conn.cursor()
                 password_hash = hashlib.sha256(password.encode()).hexdigest()
 
                 cursor.execute('''
-                INSERT INTO users (username, email, password_hash)
-                VALUES (?, ?, ?)
-                ''', (username, email, password_hash))
+                INSERT INTO users (username, email, password_hash, register_ip, expires_at)
+                VALUES (?, ?, ?, ?, ?)
+                ''', (username, email, password_hash, register_ip, expires_at))
 
                 self.conn.commit()
-                logger.info(f"创建用户成功: {username} ({email})")
+                logger.info(f"创建用户成功: {username} ({email}, ip={register_ip}, expires_at={expires_at})")
                 return True
             except sqlite3.IntegrityError as e:
                 logger.error(f"创建用户失败，用户名或邮箱已存在: {e}")
@@ -2643,13 +2800,215 @@ class DBManager:
                 self.conn.rollback()
                 return False
 
+    # ==================== 会员到期与权益 ====================
+    def count_users_by_register_ip(self, register_ip: str) -> int:
+        """统计某个真实 IP 已经注册过的用户数（用于首登赠送体验权益）"""
+        if not register_ip:
+            return 0
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, "SELECT COUNT(*) FROM users WHERE register_ip = ?", (register_ip,))
+                return int((cursor.fetchone() or [0])[0])
+            except Exception as e:
+                logger.error(f"按 IP 统计用户失败: {e}")
+                return 0
+
+    def get_user_expiry(self, user_id: int) -> Optional[float]:
+        """返回 user_id 的到期时间戳（None=永久）"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, "SELECT expires_at FROM users WHERE id = ?", (user_id,))
+                row = cursor.fetchone()
+                return row[0] if row else None
+            except Exception as e:
+                logger.error(f"读取用户到期时间失败: {e}")
+                return None
+
+    def set_user_expiry(self, user_id: int, expires_at: Optional[float]) -> bool:
+        """直接覆盖到期时间（None=永久）"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor,
+                    "UPDATE users SET expires_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (expires_at, user_id))
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"设置用户到期时间失败: {e}")
+                self.conn.rollback()
+                return False
+
+    def extend_user_expiry(self, user_id: int, days: int) -> Optional[float]:
+        """在当前到期时间基础上延长 N 天；若已过期或为空则从现在开始算。返回新的到期时间戳。"""
+        if days <= 0:
+            return None
+        import time as _t
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, "SELECT expires_at FROM users WHERE id = ?", (user_id,))
+                row = cursor.fetchone()
+                if not row:
+                    return None
+                current = row[0]
+                now = _t.time()
+                base = current if (current is not None and current > now) else now
+                new_expiry = base + days * 86400
+                self._execute_sql(cursor,
+                    "UPDATE users SET expires_at = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                    (new_expiry, user_id))
+                self.conn.commit()
+                return new_expiry
+            except Exception as e:
+                logger.error(f"续期失败: {e}")
+                self.conn.rollback()
+                return None
+
+    def is_user_expired(self, user_id: int) -> bool:
+        """判断用户是否已到期（admin 永远不过期需调用方判断 username）"""
+        import time as _t
+        expiry = self.get_user_expiry(user_id)
+        if expiry is None:
+            return False
+        return _t.time() >= expiry
+
+    # ---- 权益价格 ----
+    def get_entitlement_prices(self) -> List[Dict[str, Any]]:
+        """获取所有权益档位"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor,
+                    "SELECT key, name, days, price, enabled, sort_order, updated_at FROM entitlement_prices ORDER BY sort_order, days")
+                out = []
+                for r in cursor.fetchall():
+                    out.append({
+                        'key': r[0], 'name': r[1], 'days': int(r[2]),
+                        'price': float(r[3]), 'enabled': bool(r[4]),
+                        'sort_order': int(r[5] or 0), 'updated_at': r[6],
+                    })
+                return out
+            except Exception as e:
+                logger.error(f"获取权益价格失败: {e}")
+                return []
+
+    def get_entitlement_price(self, key: str) -> Optional[Dict[str, Any]]:
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor,
+                    "SELECT key, name, days, price, enabled, sort_order FROM entitlement_prices WHERE key = ?",
+                    (key,))
+                r = cursor.fetchone()
+                if not r:
+                    return None
+                return {'key': r[0], 'name': r[1], 'days': int(r[2]),
+                        'price': float(r[3]), 'enabled': bool(r[4]), 'sort_order': int(r[5] or 0)}
+            except Exception as e:
+                logger.error(f"获取权益价格失败: {e}")
+                return None
+
+    def upsert_entitlement_price(self, key: str, name: str, days: int,
+                                 price: float, enabled: bool = True,
+                                 sort_order: int = 0) -> bool:
+        """新增或更新一个权益档位"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor,
+                    "INSERT INTO entitlement_prices (key, name, days, price, enabled, sort_order, updated_at) "
+                    "VALUES (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP) "
+                    "ON CONFLICT(key) DO UPDATE SET name=excluded.name, days=excluded.days, "
+                    "price=excluded.price, enabled=excluded.enabled, sort_order=excluded.sort_order, "
+                    "updated_at=CURRENT_TIMESTAMP",
+                    (key, name, int(days), float(price), 1 if enabled else 0, int(sort_order)))
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"写入权益价格失败: {e}")
+                self.conn.rollback()
+                return False
+
+    def delete_entitlement_price(self, key: str) -> bool:
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, "DELETE FROM entitlement_prices WHERE key = ?", (key,))
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"删除权益价格失败: {e}")
+                self.conn.rollback()
+                return False
+
+    # ---- 会话 Token 持久化 ----
+    def save_session_token(self, token: str, user_id: int, username: str, is_admin: bool, timestamp: float) -> bool:
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor,
+                    "INSERT INTO session_tokens (token, user_id, username, is_admin, timestamp) VALUES (?, ?, ?, ?, ?) "
+                    "ON CONFLICT(token) DO UPDATE SET user_id=excluded.user_id, username=excluded.username, "
+                    "is_admin=excluded.is_admin, timestamp=excluded.timestamp",
+                    (token, int(user_id), username, 1 if is_admin else 0, float(timestamp)))
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"保存 session_token 失败: {e}")
+                try:
+                    self.conn.rollback()
+                except Exception:
+                    pass
+                return False
+
+    def delete_session_token(self, token: str) -> bool:
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, "DELETE FROM session_tokens WHERE token = ?", (token,))
+                self.conn.commit()
+                return cursor.rowcount > 0
+            except Exception as e:
+                logger.error(f"删除 session_token 失败: {e}")
+                return False
+
+    def load_active_session_tokens(self, expire_seconds: float) -> List[Dict[str, Any]]:
+        """加载未过期的 token；同时自动清理过期 token"""
+        import time as _t
+        cutoff = _t.time() - float(expire_seconds)
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                # 先清理过期
+                self._execute_sql(cursor, "DELETE FROM session_tokens WHERE timestamp < ?", (cutoff,))
+                self.conn.commit()
+                self._execute_sql(cursor,
+                    "SELECT token, user_id, username, is_admin, timestamp FROM session_tokens")
+                rows = cursor.fetchall()
+                out = []
+                for r in rows:
+                    out.append({
+                        'token': r[0],
+                        'user_id': int(r[1]),
+                        'username': r[2],
+                        'is_admin': bool(r[3]),
+                        'timestamp': float(r[4]),
+                    })
+                return out
+            except Exception as e:
+                logger.error(f"加载 session_tokens 失败: {e}")
+                return []
+
     def get_user_by_username(self, username: str) -> Optional[Dict[str, Any]]:
         """根据用户名获取用户信息"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                SELECT id, username, email, password_hash, is_active, created_at, updated_at
+                SELECT id, username, email, password_hash, is_active, created_at, updated_at, expires_at, register_ip
                 FROM users WHERE username = ?
                 ''', (username,))
 
@@ -2662,7 +3021,9 @@ class DBManager:
                         'password_hash': row[3],
                         'is_active': row[4],
                         'created_at': row[5],
-                        'updated_at': row[6]
+                        'updated_at': row[6],
+                        'expires_at': row[7] if len(row) > 7 else None,
+                        'register_ip': row[8] if len(row) > 8 else None,
                     }
                 return None
             except Exception as e:
@@ -2675,7 +3036,7 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                SELECT id, username, email, password_hash, is_active, created_at, updated_at
+                SELECT id, username, email, password_hash, is_active, created_at, updated_at, expires_at, register_ip
                 FROM users WHERE email = ?
                 ''', (email,))
 
@@ -2688,7 +3049,9 @@ class DBManager:
                         'password_hash': row[3],
                         'is_active': row[4],
                         'created_at': row[5],
-                        'updated_at': row[6]
+                        'updated_at': row[6],
+                        'expires_at': row[7] if len(row) > 7 else None,
+                        'register_ip': row[8] if len(row) > 8 else None,
                     }
                 return None
             except Exception as e:
@@ -3033,7 +3396,7 @@ class DBManager:
                    text_content: str = None, data_content: str = None, image_url: str = None,
                    description: str = None, enabled: bool = True, delay_seconds: int = 0,
                    is_multi_spec: bool = False, spec_name: str = None, spec_value: str = None,
-                   user_id: int = None):
+                   user_id: int = None, cost_price: float = None, admin_note: str = None):
         """创建新卡券（支持多规格）"""
         with self.lock:
             try:
@@ -3071,14 +3434,23 @@ class DBManager:
                     else:
                         api_config_str = str(api_config)
 
+                # 新卡券的 sort_order 默认排在最后
+                try:
+                    cursor.execute(
+                        "SELECT COALESCE(MAX(sort_order), 0) + 1 FROM cards" + (" WHERE user_id = ?" if user_id is not None else ""),
+                        ((user_id,) if user_id is not None else ()),
+                    )
+                    _next_order = cursor.fetchone()[0] or 1
+                except Exception:
+                    _next_order = 1
                 cursor.execute('''
                 INSERT INTO cards (name, type, api_config, text_content, data_content, image_url,
                                  description, enabled, delay_seconds, is_multi_spec,
-                                 spec_name, spec_value, user_id)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                 spec_name, spec_value, user_id, cost_price, admin_note, sort_order)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (name, card_type, api_config_str, text_content, data_content, image_url,
                       description, enabled, delay_seconds, is_multi_spec,
-                      spec_name, spec_value, user_id))
+                      spec_name, spec_value, user_id, cost_price, admin_note, _next_order))
                 self.conn.commit()
                 card_id = cursor.lastrowid
 
@@ -3092,44 +3464,46 @@ class DBManager:
                 raise
 
     def get_all_cards(self, user_id: int = None):
-        """获取所有卡券（支持用户隔离）"""
+        """获取所有卡券（支持用户隔离）— 含成本价/管理员备注/排序，以及批量类型的剩余/已售数量统计。"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
+                base_sql = '''
+                    SELECT c.id, c.name, c.type, c.api_config, c.text_content, c.data_content, c.image_url,
+                           c.description, c.enabled, c.delay_seconds, c.is_multi_spec,
+                           c.spec_name, c.spec_value, c.created_at, c.updated_at,
+                           c.cost_price, c.admin_note, COALESCE(c.sort_order, 0) AS sort_order,
+                           (SELECT COUNT(1) FROM card_consumption_log l
+                                WHERE l.card_id = c.id AND COALESCE(l.restored, 0) = 0) AS sold_count
+                    FROM cards c
+                '''
                 if user_id is not None:
-                    cursor.execute('''
-                    SELECT id, name, type, api_config, text_content, data_content, image_url,
-                           description, enabled, delay_seconds, is_multi_spec,
-                           spec_name, spec_value, created_at, updated_at
-                    FROM cards
-                    WHERE user_id = ?
-                    ORDER BY created_at DESC
-                    ''', (user_id,))
+                    cursor.execute(base_sql + " WHERE c.user_id = ? ORDER BY sort_order ASC, c.id DESC", (user_id,))
                 else:
-                    cursor.execute('''
-                    SELECT id, name, type, api_config, text_content, data_content, image_url,
-                           description, enabled, delay_seconds, is_multi_spec,
-                           spec_name, spec_value, created_at, updated_at
-                    FROM cards
-                    ORDER BY created_at DESC
-                    ''')
+                    cursor.execute(base_sql + " ORDER BY sort_order ASC, c.id DESC")
 
                 cards = []
                 for row in cursor.fetchall():
-                    # 解析api_config JSON字符串
+                    # 解析 api_config JSON 字符串
                     api_config = row[3]
                     if api_config:
                         try:
                             import json
                             api_config = json.loads(api_config)
                         except (json.JSONDecodeError, TypeError):
-                            # 如果解析失败，保持原始字符串
                             pass
+
+                    ctype = row[2]
+                    data_content = row[5] or ''
+                    # 剩余数量（仅批量数据/批量账密类型有意义）
+                    remaining = None
+                    if ctype in ('data', 'cred'):
+                        remaining = len([ln for ln in data_content.split('\n') if ln.strip()])
 
                     cards.append({
                         'id': row[0],
                         'name': row[1],
-                        'type': row[2],
+                        'type': ctype,
                         'api_config': api_config,
                         'text_content': row[4],
                         'data_content': row[5],
@@ -3141,13 +3515,43 @@ class DBManager:
                         'spec_name': row[11],
                         'spec_value': row[12],
                         'created_at': row[13],
-                        'updated_at': row[14]
+                        'updated_at': row[14],
+                        'cost_price': row[15],
+                        'admin_note': row[16],
+                        'sort_order': row[17] or 0,
+                        'sold_count': int(row[18] or 0),
+                        'remaining_count': remaining,
                     })
 
                 return cards
             except Exception as e:
                 logger.error(f"获取卡券列表失败: {e}")
                 return []
+
+    def reorder_cards(self, ordered_ids: List[int], user_id: int = None) -> bool:
+        """按给定的 id 顺序依次设置 sort_order=1..N（只影响该 user 的记录）。"""
+        if not ordered_ids:
+            return True
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                for idx, cid in enumerate(ordered_ids, start=1):
+                    if user_id is not None:
+                        cursor.execute(
+                            "UPDATE cards SET sort_order = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ? AND user_id = ?",
+                            (idx, int(cid), user_id),
+                        )
+                    else:
+                        cursor.execute(
+                            "UPDATE cards SET sort_order = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                            (idx, int(cid)),
+                        )
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"更新卡券排序失败: {e}")
+                self.conn.rollback()
+                return False
 
     def get_card_by_id(self, card_id: int, user_id: int = None):
         """根据ID获取卡券（支持用户隔离）"""
@@ -3207,7 +3611,7 @@ class DBManager:
                    api_config=None, text_content: str = None, data_content: str = None,
                    image_url: str = None, description: str = None, enabled: bool = None,
                    delay_seconds: int = None, is_multi_spec: bool = None, spec_name: str = None,
-                   spec_value: str = None):
+                   spec_value: str = None, cost_price=..., admin_note=...):
         """更新卡券"""
         with self.lock:
             try:
@@ -3262,6 +3666,13 @@ class DBManager:
                 if spec_value is not None:
                     update_fields.append("spec_value = ?")
                     params.append(spec_value)
+                # cost_price / admin_note 使用 sentinel：未传 不更新；传 None 清空
+                if cost_price is not ...:
+                    update_fields.append("cost_price = ?")
+                    params.append(cost_price)
+                if admin_note is not ...:
+                    update_fields.append("admin_note = ?")
+                    params.append(admin_note)
 
                 if not update_fields:
                     return True  # 没有需要更新的字段
@@ -3312,19 +3723,105 @@ class DBManager:
 
     # ==================== 自动发货规则方法 ====================
 
+    @staticmethod
+    def _normalize_bonus_tiers(raw) -> Optional[str]:
+        """把 bonus_tiers 输入归一为 "buy1:gift1,buy2:gift2" 字符串形式存库。
+        接受字符串（"10:1, 20:2"）或列表（[[10,1],[20,2]] / [{"buy":10,"gift":1}]）。
+        非法/空 → 返回 None。"""
+        if raw is None:
+            return None
+        tiers = []
+        try:
+            if isinstance(raw, str):
+                if not raw.strip():
+                    return None
+                for chunk in raw.replace('，', ',').replace('：', ':').split(','):
+                    chunk = chunk.strip()
+                    if not chunk:
+                        continue
+                    if ':' not in chunk:
+                        continue
+                    a, b = chunk.split(':', 1)
+                    tiers.append((int(a.strip()), int(b.strip())))
+            elif isinstance(raw, (list, tuple)):
+                for it in raw:
+                    if isinstance(it, dict):
+                        tiers.append((int(it.get('buy', 0)), int(it.get('gift', 0))))
+                    elif isinstance(it, (list, tuple)) and len(it) >= 2:
+                        tiers.append((int(it[0]), int(it[1])))
+            else:
+                return None
+        except Exception:
+            return None
+        # 过滤非法 / 排序去重
+        tiers = [(b, g) for (b, g) in tiers if b > 0 and g >= 0]
+        if not tiers:
+            return None
+        tiers = sorted(set(tiers), key=lambda x: x[0])
+        return ','.join(f"{b}:{g}" for b, g in tiers)
+
+    @staticmethod
+    def parse_bonus_tiers(raw) -> List[Tuple[int, int]]:
+        """解析 bonus_tiers 为 [(buy, gift), ...]，按 buy 升序。"""
+        if not raw:
+            return []
+        out: List[Tuple[int, int]] = []
+        try:
+            if isinstance(raw, str):
+                for chunk in raw.replace('，', ',').replace('：', ':').split(','):
+                    chunk = chunk.strip()
+                    if not chunk or ':' not in chunk:
+                        continue
+                    a, b = chunk.split(':', 1)
+                    try:
+                        out.append((int(a.strip()), int(b.strip())))
+                    except Exception:
+                        continue
+            elif isinstance(raw, (list, tuple)):
+                for it in raw:
+                    if isinstance(it, dict):
+                        out.append((int(it.get('buy', 0)), int(it.get('gift', 0))))
+                    elif isinstance(it, (list, tuple)) and len(it) >= 2:
+                        out.append((int(it[0]), int(it[1])))
+        except Exception:
+            return []
+        return sorted([(b, g) for (b, g) in out if b > 0 and g >= 0], key=lambda x: x[0])
+
+    @classmethod
+    def compute_bonus(cls, bonus_tiers, qty: int) -> int:
+        """根据购买数量与 tiers 算出额外赠送数量（取 buy <= qty 的最大档）。"""
+        try:
+            qty = int(qty)
+        except Exception:
+            return 0
+        if qty <= 0:
+            return 0
+        tiers = cls.parse_bonus_tiers(bonus_tiers)
+        if not tiers:
+            return 0
+        bonus = 0
+        for buy, gift in tiers:
+            if qty >= buy:
+                bonus = gift  # tiers 已按 buy 升序，取满足条件的最后一档
+            else:
+                break
+        return max(0, int(bonus))
+
     def create_delivery_rule(self, keyword: str, card_id: int, delivery_count: int = 1,
-                           enabled: bool = True, description: str = None, user_id: int = None):
-        """创建发货规则"""
+                           enabled: bool = True, description: str = None, user_id: int = None,
+                           item_id: str = None, bonus_tiers: str = None):
+        """创建发货规则（可选 item_id 按商品ID精准匹配；bonus_tiers 为“买X赠Y”梯度字符串，如 "10:1,20:2"）"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                INSERT INTO delivery_rules (keyword, card_id, delivery_count, enabled, description, user_id)
-                VALUES (?, ?, ?, ?, ?, ?)
-                ''', (keyword, card_id, delivery_count, enabled, description, user_id))
+                INSERT INTO delivery_rules (keyword, card_id, delivery_count, enabled, description, user_id, item_id, bonus_tiers)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''', (keyword, card_id, delivery_count, enabled, description, user_id, item_id,
+                      self._normalize_bonus_tiers(bonus_tiers)))
                 self.conn.commit()
                 rule_id = cursor.lastrowid
-                logger.info(f"创建发货规则成功: {keyword} -> 卡券ID {card_id} (规则ID: {rule_id})")
+                logger.info(f"创建发货规则成功: {keyword} -> 卡券ID {card_id} 商品ID={item_id} (规则ID: {rule_id})")
                 return rule_id
             except Exception as e:
                 logger.error(f"创建发货规则失败: {e}")
@@ -3340,7 +3837,7 @@ class DBManager:
                     SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
                            dr.description, dr.delivery_times, dr.created_at, dr.updated_at,
                            c.name as card_name, c.type as card_type,
-                           c.is_multi_spec, c.spec_name, c.spec_value
+                           c.is_multi_spec, c.spec_name, c.spec_value, dr.item_id, dr.bonus_tiers
                     FROM delivery_rules dr
                     LEFT JOIN cards c ON dr.card_id = c.id
                     WHERE dr.user_id = ?
@@ -3351,7 +3848,7 @@ class DBManager:
                     SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
                            dr.description, dr.delivery_times, dr.created_at, dr.updated_at,
                            c.name as card_name, c.type as card_type,
-                           c.is_multi_spec, c.spec_name, c.spec_value
+                           c.is_multi_spec, c.spec_name, c.spec_value, dr.item_id, dr.bonus_tiers
                     FROM delivery_rules dr
                     LEFT JOIN cards c ON dr.card_id = c.id
                     ORDER BY dr.created_at DESC
@@ -3373,7 +3870,9 @@ class DBManager:
                         'card_type': row[10],
                         'is_multi_spec': bool(row[11]) if row[11] is not None else False,
                         'spec_name': row[12],
-                        'spec_value': row[13]
+                        'spec_value': row[13],
+                        'item_id': row[14],
+                        'bonus_tiers': row[15],
                     })
 
                 return rules
@@ -3381,30 +3880,62 @@ class DBManager:
                 logger.error(f"获取发货规则列表失败: {e}")
                 return []
 
-    def get_delivery_rules_by_keyword(self, keyword: str):
-        """根据关键字获取匹配的发货规则"""
+    def get_delivery_rules_by_keyword(self, keyword: str, item_id: str = None):
+        """根据关键字获取匹配的发货规则。如传 item_id，会优先返回绑定该商品ID的规则。"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
-                # 使用更灵活的匹配方式：既支持商品内容包含关键字，也支持关键字包含在商品内容中
-                cursor.execute('''
-                SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
-                       dr.description, dr.delivery_times,
-                       c.name as card_name, c.type as card_type, c.api_config,
-                       c.text_content, c.data_content, c.image_url, c.enabled as card_enabled, c.description as card_description,
-                       c.delay_seconds as card_delay_seconds,
-                       c.is_multi_spec, c.spec_name, c.spec_value
-                FROM delivery_rules dr
-                LEFT JOIN cards c ON dr.card_id = c.id
-                WHERE dr.enabled = 1 AND c.enabled = 1
-                AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')
-                ORDER BY
-                    CASE
-                        WHEN ? LIKE '%' || dr.keyword || '%' THEN LENGTH(dr.keyword)
-                        ELSE LENGTH(dr.keyword) / 2
-                    END DESC,
-                    dr.id ASC
-                ''', (keyword, keyword, keyword))
+                # 商品ID精准匹配：优先返回 dr.item_id = item_id 的规则；
+                # 其次允许 item_id IS NULL/'' 的通用规则。
+                if item_id:
+                    # 绑定该商品ID的规则不需要关键词匹配（item_id 即触发条件）
+                    # 通用规则（item_id 为空）仍需关键词匹配
+                    cursor.execute('''
+                    SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
+                           dr.description, dr.delivery_times,
+                           c.name as card_name, c.type as card_type, c.api_config,
+                           c.text_content, c.data_content, c.image_url, c.enabled as card_enabled, c.description as card_description,
+                           c.delay_seconds as card_delay_seconds,
+                           c.is_multi_spec, c.spec_name, c.spec_value, dr.item_id, dr.bonus_tiers
+                    FROM delivery_rules dr
+                    LEFT JOIN cards c ON dr.card_id = c.id
+                    WHERE dr.enabled = 1 AND c.enabled = 1
+                    AND (
+                         dr.item_id = ?
+                         OR (
+                             (dr.item_id IS NULL OR dr.item_id = '')
+                             AND dr.keyword <> ''
+                             AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')
+                         )
+                    )
+                    ORDER BY
+                        CASE WHEN dr.item_id = ? THEN 0 ELSE 1 END,
+                        CASE
+                            WHEN ? LIKE '%' || dr.keyword || '%' THEN LENGTH(dr.keyword)
+                            ELSE LENGTH(dr.keyword) / 2
+                        END DESC,
+                        dr.id ASC
+                    ''', (item_id, keyword, keyword, item_id, keyword))
+                else:
+                    cursor.execute('''
+                    SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
+                           dr.description, dr.delivery_times,
+                           c.name as card_name, c.type as card_type, c.api_config,
+                           c.text_content, c.data_content, c.image_url, c.enabled as card_enabled, c.description as card_description,
+                           c.delay_seconds as card_delay_seconds,
+                           c.is_multi_spec, c.spec_name, c.spec_value, dr.item_id, dr.bonus_tiers
+                    FROM delivery_rules dr
+                    LEFT JOIN cards c ON dr.card_id = c.id
+                    WHERE dr.enabled = 1 AND c.enabled = 1
+                    AND (dr.item_id IS NULL OR dr.item_id = '')
+                    AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')
+                    ORDER BY
+                        CASE
+                            WHEN ? LIKE '%' || dr.keyword || '%' THEN LENGTH(dr.keyword)
+                            ELSE LENGTH(dr.keyword) / 2
+                        END DESC,
+                        dr.id ASC
+                    ''', (keyword, keyword, keyword))
 
                 rules = []
                 for row in cursor.fetchall():
@@ -3437,7 +3968,9 @@ class DBManager:
                         'card_delay_seconds': row[15] or 0,  # 延时秒数
                         'is_multi_spec': bool(row[16]) if row[16] is not None else False,
                         'spec_name': row[17],
-                        'spec_value': row[18]
+                        'spec_value': row[18],
+                        'item_id': row[19] if len(row) > 19 else None,
+                        'bonus_tiers': row[20] if len(row) > 20 else None,
                     })
 
                 return rules
@@ -3491,8 +4024,9 @@ class DBManager:
 
     def update_delivery_rule(self, rule_id: int, keyword: str = None, card_id: int = None,
                            delivery_count: int = None, enabled: bool = None,
-                           description: str = None, user_id: int = None):
-        """更新发货规则（支持用户隔离）"""
+                           description: str = None, user_id: int = None,
+                           item_id: "str | None" = ..., bonus_tiers: "str | None" = ...):
+        """更新发货规则（支持用户隔离；item_id 与 bonus_tiers 使用 sentinel ... 区分未传 vs 清空）"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
@@ -3516,6 +4050,14 @@ class DBManager:
                 if description is not None:
                     update_fields.append("description = ?")
                     params.append(description)
+                # item_id 使用 sentinel 区分未传 vs 传 None（清空）
+                if item_id is not ...:
+                    update_fields.append("item_id = ?")
+                    params.append(item_id)
+                # bonus_tiers 同样支持清空
+                if bonus_tiers is not ...:
+                    update_fields.append("bonus_tiers = ?")
+                    params.append(self._normalize_bonus_tiers(bonus_tiers))
 
                 if not update_fields:
                     return True  # 没有需要更新的字段
@@ -3558,33 +4100,49 @@ class DBManager:
             except Exception as e:
                 logger.error(f"更新发货次数失败: {e}")
 
-    def get_delivery_rules_by_keyword_and_spec(self, keyword: str, spec_name: str = None, spec_value: str = None):
-        """根据关键字和规格信息获取匹配的发货规则（支持多规格）"""
+    def get_delivery_rules_by_keyword_and_spec(self, keyword: str, spec_name: str = None, spec_value: str = None, item_id: str = None):
+        """根据关键字和规格信息获取匹配的发货规则（支持多规格）。可选 item_id 优先匹配。"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
 
+                # 商品ID精准匹配过滤片段：
+                # - 绑定该商品ID的规则不需要关键词匹配；
+                # - 通用规则（item_id 为空）仍需关键词非空且匹配。
+                if item_id:
+                    _iid_filter = ("AND (dr.item_id = ? OR ((dr.item_id IS NULL OR dr.item_id = '') "
+                                   "AND dr.keyword <> '' AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')))")
+                    _iid_filter_params = [item_id, keyword, keyword]
+                else:
+                    _iid_filter = ("AND (dr.item_id IS NULL OR dr.item_id = '') "
+                                   "AND dr.keyword <> '' "
+                                   "AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')")
+                    _iid_filter_params = [keyword, keyword]
+                _iid_order = "CASE WHEN dr.item_id = ? THEN 0 ELSE 1 END," if item_id else ""
+                _iid_order_params = [item_id] if item_id else []
+
                 # 优先匹配：卡券名称+规格名称+规格值
                 if spec_name and spec_value:
-                    cursor.execute('''
+                    cursor.execute(f'''
                     SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
                            dr.description, dr.delivery_times,
                            c.name as card_name, c.type as card_type, c.api_config,
                            c.text_content, c.data_content, c.enabled as card_enabled,
                            c.description as card_description, c.delay_seconds as card_delay_seconds,
-                           c.is_multi_spec, c.spec_name, c.spec_value
+                           c.is_multi_spec, c.spec_name, c.spec_value, dr.bonus_tiers
                     FROM delivery_rules dr
                     LEFT JOIN cards c ON dr.card_id = c.id
                     WHERE dr.enabled = 1 AND c.enabled = 1
-                    AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')
+                    {_iid_filter}
                     AND c.is_multi_spec = 1 AND c.spec_name = ? AND c.spec_value = ?
                     ORDER BY
+                        {_iid_order}
                         CASE
                             WHEN ? LIKE '%' || dr.keyword || '%' THEN LENGTH(dr.keyword)
                             ELSE LENGTH(dr.keyword) / 2
                         END DESC,
                         dr.delivery_times ASC
-                    ''', (keyword, keyword, spec_name, spec_value, keyword))
+                    ''', tuple(_iid_filter_params + [spec_name, spec_value] + _iid_order_params + [keyword]))
 
                     rules = []
                     for row in cursor.fetchall():
@@ -3616,7 +4174,8 @@ class DBManager:
                             'card_delay_seconds': row[14] or 0,
                             'is_multi_spec': bool(row[15]),
                             'spec_name': row[16],
-                            'spec_value': row[17]
+                            'spec_value': row[17],
+                            'bonus_tiers': row[18] if len(row) > 18 else None,
                         })
 
                     if rules:
@@ -3624,25 +4183,26 @@ class DBManager:
                         return rules
 
                 # 兜底匹配：仅卡券名称
-                cursor.execute('''
+                cursor.execute(f'''
                 SELECT dr.id, dr.keyword, dr.card_id, dr.delivery_count, dr.enabled,
                        dr.description, dr.delivery_times,
                        c.name as card_name, c.type as card_type, c.api_config,
                        c.text_content, c.data_content, c.enabled as card_enabled,
                        c.description as card_description, c.delay_seconds as card_delay_seconds,
-                       c.is_multi_spec, c.spec_name, c.spec_value
+                       c.is_multi_spec, c.spec_name, c.spec_value, dr.bonus_tiers
                 FROM delivery_rules dr
                 LEFT JOIN cards c ON dr.card_id = c.id
                 WHERE dr.enabled = 1 AND c.enabled = 1
-                AND (? LIKE '%' || dr.keyword || '%' OR dr.keyword LIKE '%' || ? || '%')
+                {_iid_filter}
                 AND (c.is_multi_spec = 0 OR c.is_multi_spec IS NULL)
                 ORDER BY
+                    {_iid_order}
                     CASE
                         WHEN ? LIKE '%' || dr.keyword || '%' THEN LENGTH(dr.keyword)
                         ELSE LENGTH(dr.keyword) / 2
                     END DESC,
                     dr.delivery_times ASC
-                ''', (keyword, keyword, keyword))
+                ''', tuple(_iid_filter_params + _iid_order_params + [keyword]))
 
                 rules = []
                 for row in cursor.fetchall():
@@ -3674,7 +4234,8 @@ class DBManager:
                         'card_delay_seconds': row[14] or 0,
                         'is_multi_spec': bool(row[15]) if row[15] is not None else False,
                         'spec_name': row[16],
-                        'spec_value': row[17]
+                        'spec_value': row[17],
+                        'bonus_tiers': row[18] if len(row) > 18 else None,
                     })
 
                 if rules:
@@ -3729,31 +4290,34 @@ class DBManager:
                 self.conn.rollback()
                 raise
 
-    def consume_batch_data(self, card_id: int):
-        """消费批量数据的第一条记录（线程安全）"""
+    def consume_batch_data(self, card_id: int, *, rule_id: Optional[int] = None,
+                           order_id: Optional[str] = None, buyer_id: Optional[str] = None,
+                           cookie_id: Optional[str] = None, item_id: Optional[str] = None,
+                           sold_price: Optional[str] = None):
+        """消费批量数据的第一条记录（线程安全），并写入消费记录表用于售后追溯/恢复。
+        sold_price: 售卖价格快照（通常为订单金额），仅用于记录查看，不影响发货内容。"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
 
-                # 获取卡券的批量数据
-                self._execute_sql(cursor, "SELECT data_content FROM cards WHERE id = ? AND type = 'data'", (card_id,))
+                # 获取卡券的批量数据 + 名称 + 所属用户（兼容批量数据 data 和批量账密 cred）
+                self._execute_sql(cursor,
+                    "SELECT data_content, name, user_id FROM cards WHERE id = ? AND type IN ('data', 'cred')",
+                    (card_id,))
                 result = cursor.fetchone()
 
                 if not result or not result[0]:
                     logger.warning(f"卡券 {card_id} 没有批量数据")
                     return None
 
-                data_content = result[0]
+                data_content, card_name, user_id = result[0], result[1], result[2]
                 lines = [line.strip() for line in data_content.split('\n') if line.strip()]
 
                 if not lines:
                     logger.warning(f"卡券 {card_id} 批量数据为空")
                     return None
 
-                # 获取第一条数据
                 first_line = lines[0]
-
-                # 移除第一条数据，更新数据库
                 remaining_lines = lines[1:]
                 new_data_content = '\n'.join(remaining_lines)
 
@@ -3763,15 +4327,204 @@ class DBManager:
                 WHERE id = ?
                 ''', (new_data_content, card_id))
 
+                # 如未提供 sold_price，从 orders 表兜底读取该订单金额
+                if not sold_price and order_id:
+                    try:
+                        cursor.execute("SELECT amount FROM orders WHERE order_id = ? LIMIT 1", (order_id,))
+                        _row = cursor.fetchone()
+                        if _row and _row[0]:
+                            sold_price = str(_row[0])
+                    except Exception:
+                        pass
+
+                # 写入消费记录（含 sold_price 字段，若迁移未执行则回退老格式）
+                try:
+                    cursor.execute('''
+                    INSERT INTO card_consumption_log
+                        (card_id, card_name, content, rule_id, order_id, buyer_id, cookie_id, item_id, user_id, sold_price)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (card_id, card_name, first_line, rule_id, order_id, buyer_id, cookie_id, item_id, user_id, sold_price))
+                except sqlite3.OperationalError:
+                    cursor.execute('''
+                    INSERT INTO card_consumption_log
+                        (card_id, card_name, content, rule_id, order_id, buyer_id, cookie_id, item_id, user_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''', (card_id, card_name, first_line, rule_id, order_id, buyer_id, cookie_id, item_id, user_id))
+
                 self.conn.commit()
 
-                logger.info(f"消费批量数据成功: 卡券ID={card_id}, 剩余={len(remaining_lines)}条")
+                logger.info(f"消费批量数据成功: 卡券ID={card_id}, 剩余={len(remaining_lines)}条, 订单={order_id}")
                 return first_line
 
             except Exception as e:
                 logger.error(f"消费批量数据失败: {e}")
                 self.conn.rollback()
                 return None
+
+    # ==================== 卡券消费记录管理 ====================
+
+    def list_card_consumptions(self, user_id: Optional[int] = None, *, card_id: Optional[int] = None,
+                               restored: Optional[bool] = None, search: Optional[str] = None,
+                               limit: int = 200, offset: int = 0) -> List[Dict[str, Any]]:
+        """查询卡券消费记录（管理员可不传 user_id 查所有）"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                where = []
+                params: list = []
+                if user_id is not None:
+                    where.append("user_id = ?")
+                    params.append(user_id)
+                if card_id is not None:
+                    where.append("card_id = ?")
+                    params.append(card_id)
+                if restored is not None:
+                    where.append("restored = ?")
+                    params.append(1 if restored else 0)
+                if search:
+                    where.append("(content LIKE ? OR order_id LIKE ? OR buyer_id LIKE ? OR card_name LIKE ?)")
+                    kw = f"%{search}%"
+                    params.extend([kw, kw, kw, kw])
+                # 列名前加 l. 前缀（与 JOIN 后的查询一致）
+                _where_fixed = []
+                for w in where:
+                    _w = w
+                    for col in ('user_id', 'card_id', 'restored', 'content', 'order_id', 'buyer_id', 'card_name'):
+                        _w = _w.replace(col, f"l.{col}") if f"l.{col}" not in _w else _w
+                    _where_fixed.append(_w)
+                where_sql = ("WHERE " + " AND ".join(_where_fixed)) if _where_fixed else ""
+                # 兼容老库（sold_price 可能不存在）：用 try 捕获后回退
+                try:
+                    sql = f'''
+                    SELECT l.id, l.card_id, l.card_name, l.content, l.rule_id, l.order_id, l.buyer_id,
+                           l.cookie_id, l.item_id, l.user_id, l.restored, l.restored_at, l.consumed_at,
+                           COALESCE(NULLIF(l.sold_price, ''), o.amount) AS sold_price,
+                           c.cost_price
+                    FROM card_consumption_log l
+                    LEFT JOIN cards c ON c.id = l.card_id
+                    LEFT JOIN orders o ON o.order_id = l.order_id
+                    {where_sql}
+                    ORDER BY l.consumed_at DESC, l.id DESC
+                    LIMIT ? OFFSET ?
+                    '''
+                    _params = list(params) + [int(limit), int(offset)]
+                    self._execute_sql(cursor, sql, _params)
+                except sqlite3.OperationalError:
+                    sql = f'''
+                    SELECT l.id, l.card_id, l.card_name, l.content, l.rule_id, l.order_id, l.buyer_id,
+                           l.cookie_id, l.item_id, l.user_id, l.restored, l.restored_at, l.consumed_at,
+                           NULL as sold_price, NULL as cost_price
+                    FROM card_consumption_log l
+                    {where_sql}
+                    ORDER BY l.consumed_at DESC, l.id DESC
+                    LIMIT ? OFFSET ?
+                    '''
+                    _params = list(params) + [int(limit), int(offset)]
+                    self._execute_sql(cursor, sql, _params)
+                cols = [d[0] for d in cursor.description]
+                rows = []
+                for r in cursor.fetchall():
+                    d = dict(zip(cols, r))
+                    d['restored'] = bool(d.get('restored'))
+                    rows.append(d)
+                return rows
+            except Exception as e:
+                logger.error(f"查询卡券消费记录失败: {e}")
+                return []
+
+    def count_card_consumptions(self, user_id: Optional[int] = None, *, card_id: Optional[int] = None,
+                                restored: Optional[bool] = None, search: Optional[str] = None) -> int:
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                where = []
+                params: list = []
+                if user_id is not None:
+                    where.append("user_id = ?")
+                    params.append(user_id)
+                if card_id is not None:
+                    where.append("card_id = ?")
+                    params.append(card_id)
+                if restored is not None:
+                    where.append("restored = ?")
+                    params.append(1 if restored else 0)
+                if search:
+                    where.append("(content LIKE ? OR order_id LIKE ? OR buyer_id LIKE ? OR card_name LIKE ?)")
+                    kw = f"%{search}%"
+                    params.extend([kw, kw, kw, kw])
+                where_sql = ("WHERE " + " AND ".join(where)) if where else ""
+                self._execute_sql(cursor, f"SELECT COUNT(*) FROM card_consumption_log {where_sql}", params)
+                row = cursor.fetchone()
+                return int(row[0]) if row else 0
+            except Exception as e:
+                logger.error(f"统计卡券消费记录失败: {e}")
+                return 0
+
+    def restore_card_consumption(self, consumption_id: int, user_id: Optional[int] = None) -> Tuple[bool, str]:
+        """把已消费的一条卡券内容退回到卡券的 data_content（追加到末尾），并标记记录已恢复。
+        返回 (success, message)。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                if user_id is not None:
+                    self._execute_sql(cursor,
+                        "SELECT card_id, content, restored, user_id FROM card_consumption_log WHERE id = ? AND user_id = ?",
+                        (consumption_id, user_id))
+                else:
+                    self._execute_sql(cursor,
+                        "SELECT card_id, content, restored, user_id FROM card_consumption_log WHERE id = ?",
+                        (consumption_id,))
+                row = cursor.fetchone()
+                if not row:
+                    return False, "记录不存在或无权限"
+                card_id, content, restored, _uid = row[0], row[1], row[2], row[3]
+                if restored:
+                    return False, "该记录已恢复，请勿重复操作"
+
+                # 检查卡券是否仍存在且为 data 类型
+                self._execute_sql(cursor, "SELECT data_content, type FROM cards WHERE id = ?", (card_id,))
+                card_row = cursor.fetchone()
+                if not card_row:
+                    return False, "卡券已删除，无法恢复"
+                if card_row[1] != 'data':
+                    return False, "卡券类型已变更，无法恢复"
+
+                current = card_row[0] or ''
+                # 追加到末尾，保留换行；如已存在则先去重不重复追加
+                lines = [ln for ln in current.split('\n') if ln]
+                if content in lines:
+                    new_data = current  # 已经在卡券里，直接标记恢复
+                else:
+                    lines.append(content)
+                    new_data = '\n'.join(lines)
+                cursor.execute("UPDATE cards SET data_content = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                               (new_data, card_id))
+                cursor.execute("UPDATE card_consumption_log SET restored = 1, restored_at = CURRENT_TIMESTAMP WHERE id = ?",
+                               (consumption_id,))
+                self.conn.commit()
+                logger.info(f"恢复卡券消费记录成功: id={consumption_id}, card_id={card_id}")
+                return True, "恢复成功"
+            except Exception as e:
+                logger.error(f"恢复卡券消费记录失败: {e}")
+                self.conn.rollback()
+                return False, f"恢复失败: {e}"
+
+    def delete_card_consumption(self, consumption_id: int, user_id: Optional[int] = None) -> bool:
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                if user_id is not None:
+                    self._execute_sql(cursor, "DELETE FROM card_consumption_log WHERE id = ? AND user_id = ?",
+                                      (consumption_id, user_id))
+                else:
+                    self._execute_sql(cursor, "DELETE FROM card_consumption_log WHERE id = ?", (consumption_id,))
+                affected = cursor.rowcount
+                self.conn.commit()
+                return affected > 0
+            except Exception as e:
+                logger.error(f"删除卡券消费记录失败: {e}")
+                self.conn.rollback()
+                return False
 
     # ==================== 商品信息管理 ====================
 
@@ -4097,7 +4850,7 @@ class DBManager:
                 cursor.execute('''
                 SELECT * FROM item_info
                 WHERE cookie_id = ?
-                ORDER BY updated_at DESC
+                ORDER BY COALESCE(publish_time, CAST(strftime('%s', created_at) AS INTEGER) * 1000) DESC, id DESC
                 ''', (cookie_id,))
 
                 columns = [description[0] for description in cursor.description]
@@ -4109,9 +4862,15 @@ class DBManager:
                     # 解析item_detail JSON
                     if item_info.get('item_detail'):
                         try:
-                            item_info['item_detail_parsed'] = json.loads(item_info['item_detail'])
-                        except:
+                            parsed = json.loads(item_info['item_detail'])
+                            item_info['item_detail_parsed'] = parsed
+                            # 抽取主图
+                            item_info['pic_url'] = self._extract_pic_url(parsed)
+                        except Exception:
                             item_info['item_detail_parsed'] = {}
+                            item_info['pic_url'] = None
+                    else:
+                        item_info['pic_url'] = None
 
                     items.append(item_info)
 
@@ -4132,7 +4891,7 @@ class DBManager:
                 cursor = self.conn.cursor()
                 cursor.execute('''
                 SELECT * FROM item_info
-                ORDER BY updated_at DESC
+                ORDER BY COALESCE(publish_time, CAST(strftime('%s', created_at) AS INTEGER) * 1000) DESC, id DESC
                 ''')
 
                 columns = [description[0] for description in cursor.description]
@@ -4144,9 +4903,14 @@ class DBManager:
                     # 解析item_detail JSON
                     if item_info.get('item_detail'):
                         try:
-                            item_info['item_detail_parsed'] = json.loads(item_info['item_detail'])
-                        except:
+                            parsed = json.loads(item_info['item_detail'])
+                            item_info['item_detail_parsed'] = parsed
+                            item_info['pic_url'] = self._extract_pic_url(parsed)
+                        except Exception:
                             item_info['item_detail_parsed'] = {}
+                            item_info['pic_url'] = None
+                    else:
+                        item_info['pic_url'] = None
 
                     items.append(item_info)
 
@@ -4231,6 +4995,92 @@ class DBManager:
             self.conn.rollback()
             return False
 
+    @staticmethod
+    def _extract_pic_url(item_detail) -> Optional[str]:
+        """从 item_detail JSON 抽出商品主图 URL（pic_info.picUrl 或常见兜底字段）。"""
+        try:
+            data = item_detail
+            if isinstance(data, str):
+                if not data.strip():
+                    return None
+                import json as _json
+                try:
+                    data = _json.loads(data)
+                except Exception:
+                    return None
+            if not isinstance(data, dict):
+                return None
+            for key in ('pic_info', 'picInfo'):
+                v = data.get(key)
+                if isinstance(v, dict):
+                    url = v.get('picUrl') or v.get('pic_url') or v.get('url')
+                    if url:
+                        return url if str(url).startswith('http') else f"https:{url}"
+                    pics = v.get('pics') or v.get('list')
+                    if isinstance(pics, list) and pics:
+                        first = pics[0]
+                        if isinstance(first, dict):
+                            url = first.get('picUrl') or first.get('url')
+                            if url:
+                                return url if str(url).startswith('http') else f"https:{url}"
+                        elif isinstance(first, str):
+                            return first if first.startswith('http') else f"https:{first}"
+            for k in ('main_image', 'mainImage', 'main_pic', 'mainPic', 'pic_url', 'picUrl', 'image_url', 'imageUrl'):
+                v = data.get(k)
+                if isinstance(v, str) and v:
+                    return v if v.startswith('http') else f"https:{v}"
+        except Exception:
+            return None
+        return None
+
+    @staticmethod
+    def _extract_publish_time_ms(item_detail) -> Optional[int]:
+        """尝试从 item_detail JSON 里抽出商品在闲鱼上的发布时间（毫秒）。
+        可能位于 trackParams.publishTime / detailParams.publishTime / clickParam.args.publishTime 等。"""
+        try:
+            data = item_detail
+            if isinstance(data, str):
+                if not data.strip():
+                    return None
+                import json as _json
+                try:
+                    data = _json.loads(data)
+                except Exception:
+                    return None
+            if not isinstance(data, dict):
+                return None
+            candidates = []
+            for key in ('track_params', 'trackParams'):
+                if isinstance(data.get(key), dict):
+                    candidates.append(data[key].get('publishTime'))
+                    candidates.append(data[key].get('publish_time'))
+            for key in ('detail_params', 'detailParams'):
+                if isinstance(data.get(key), dict):
+                    candidates.append(data[key].get('publishTime'))
+            ck = data.get('clickParam') or data.get('click_param') or {}
+            if isinstance(ck, dict):
+                args = ck.get('args') or {}
+                if isinstance(args, dict):
+                    candidates.append(args.get('publishTime'))
+            candidates.append(data.get('publishTime'))
+            candidates.append(data.get('publish_time'))
+            for v in candidates:
+                if v in (None, '', 0):
+                    continue
+                try:
+                    n = int(v)
+                except Exception:
+                    continue
+                if n <= 0:
+                    continue
+                # 兼容秒/毫秒：< 10^12 视为秒
+                if n < 10_000_000_000:
+                    n *= 1000
+                return n
+        except Exception:
+            return None
+        return None
+
     def batch_save_item_basic_info(self, items_data: list) -> int:
         """批量保存商品基本信息（并发安全）
 
@@ -4269,13 +5119,16 @@ class DBManager:
                             logger.debug(f"跳过批量保存商品信息：缺少商品标题 - {item_id}")
                             continue
 
+                        # 抽取闲鱼商品发布时间（毫秒）
+                        publish_time_ms = self._extract_publish_time_ms(item_detail)
+
                         # 使用 INSERT OR IGNORE + UPDATE 模式
                         cursor.execute('''
                         INSERT OR IGNORE INTO item_info (cookie_id, item_id, item_title, item_description,
-                                                       item_category, item_price, item_detail, created_at, updated_at)
-                        VALUES (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
+                                                       item_category, item_price, item_detail, publish_time, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, CURRENT_TIMESTAMP)
                         ''', (cookie_id, item_id, item_title, item_description,
-                              item_category, item_price, item_detail))
+                              item_category, item_price, item_detail, publish_time_ms))
 
                         if cursor.rowcount == 0:
                             # 记录已存在，进行条件更新
@@ -4286,6 +5139,7 @@ class DBManager:
                                 item_category = CASE WHEN (item_category IS NULL OR item_category = '') AND ? != '' THEN ? ELSE item_category END,
                                 item_price = CASE WHEN (item_price IS NULL OR item_price = '') AND ? != '' THEN ? ELSE item_price END,
                                 item_detail = CASE WHEN (item_detail IS NULL OR item_detail = '' OR TRIM(item_detail) = '') AND ? != '' THEN ? ELSE item_detail END,
+                                publish_time = COALESCE(?, publish_time),
                                 updated_at = CURRENT_TIMESTAMP
                             WHERE cookie_id = ? AND item_id = ?
                             '''
@@ -4295,6 +5149,7 @@ class DBManager:
                                 item_category, item_category,
                                 item_price, item_price,
                                 item_detail, item_detail,
+                                publish_time_ms,
                                 cookie_id, item_id
                             ))
 
@@ -4471,7 +5326,7 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                SELECT id, username, email, created_at, updated_at
+                SELECT id, username, email, created_at, updated_at, expires_at, register_ip
                 FROM users
                 ORDER BY created_at DESC
                 ''')
@@ -4483,7 +5338,9 @@ class DBManager:
                         'username': row[1],
                         'email': row[2],
                         'created_at': row[3],
-                        'updated_at': row[4]
+                        'updated_at': row[4],
+                        'expires_at': row[5],
+                        'register_ip': row[6],
                     })
 
                 return users
@@ -4497,7 +5354,7 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                SELECT id, username, email, created_at, updated_at
+                SELECT id, username, email, created_at, updated_at, expires_at, register_ip
                 FROM users
                 WHERE id = ?
                 ''', (user_id,))
@@ -4509,7 +5366,9 @@ class DBManager:
                         'username': row[1],
                         'email': row[2],
                         'created_at': row[3],
-                        'updated_at': row[4]
+                        'updated_at': row[4],
+                        'expires_at': row[5],
+                        'register_ip': row[6],
                     }
                 return None
             except Exception as e:
@@ -4683,13 +5542,17 @@ class DBManager:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                SELECT order_id, item_id, buyer_id, spec_name, spec_value,
-                       quantity, amount, order_status, cookie_id, is_bargain, created_at, updated_at
-                FROM orders WHERE order_id = ?
+                SELECT o.order_id, o.item_id, o.buyer_id, o.spec_name, o.spec_value,
+                       o.quantity, o.amount, o.order_status, o.cookie_id, o.is_bargain, o.created_at, o.updated_at,
+                       i.item_title, i.item_detail
+                FROM orders o
+                LEFT JOIN item_info i ON i.cookie_id = o.cookie_id AND i.item_id = o.item_id
+                WHERE o.order_id = ?
                 ''', (order_id,))
 
                 row = cursor.fetchone()
                 if row:
+                    pic_url = self._extract_pic_url(row[13]) if row[13] else None
                     return {
                         'id': row[0],  # 使用 order_id 作为 id
                         'order_id': row[0],
@@ -4703,7 +5566,9 @@ class DBManager:
                         'cookie_id': row[8],
                         'is_bargain': bool(row[9]) if row[9] is not None else False,
                         'created_at': row[10],
-                        'updated_at': row[11]
+                        'updated_at': row[11],
+                        'item_title': row[12],
+                        'pic_url': pic_url,
                     }
                 return None
 
@@ -4728,19 +5593,23 @@ class DBManager:
                 return False
 
     def get_orders_by_cookie(self, cookie_id: str, limit: int = 100):
-        """根据Cookie ID获取订单列表"""
+        """根据Cookie ID获取订单列表（含商品图、商品标题）"""
         with self.lock:
             try:
                 cursor = self.conn.cursor()
                 cursor.execute('''
-                SELECT order_id, item_id, buyer_id, spec_name, spec_value,
-                       quantity, amount, order_status, is_bargain, created_at, updated_at
-                FROM orders WHERE cookie_id = ?
-                ORDER BY created_at DESC LIMIT ?
+                SELECT o.order_id, o.item_id, o.buyer_id, o.spec_name, o.spec_value,
+                       o.quantity, o.amount, o.order_status, o.is_bargain, o.created_at, o.updated_at,
+                       i.item_title, i.item_detail
+                FROM orders o
+                LEFT JOIN item_info i ON i.cookie_id = o.cookie_id AND i.item_id = o.item_id
+                WHERE o.cookie_id = ?
+                ORDER BY o.created_at DESC LIMIT ?
                 ''', (cookie_id, limit))
 
                 orders = []
                 for row in cursor.fetchall():
+                    pic_url = self._extract_pic_url(row[12]) if row[12] else None
                     orders.append({
                         'id': row[0],  # 使用 order_id 作为 id
                         'order_id': row[0],
@@ -4753,7 +5622,9 @@ class DBManager:
                         'status': row[7],
                         'is_bargain': bool(row[8]) if row[8] is not None else False,
                         'created_at': row[9],
-                        'updated_at': row[10]
+                        'updated_at': row[10],
+                        'item_title': row[11],
+                        'pic_url': pic_url,
                     })
 
                 return orders

@@ -1,18 +1,31 @@
 import { get, post, put, del } from '@/utils/request'
 import type { Account, AccountDetail, ApiResponse } from '@/types'
 
-// 获取账号列表（返回账号ID数组）
+// 获取账号列表（包含备注，所有页面下拉/列表共用）
 export const getAccounts = async (): Promise<Account[]> => {
-  const ids: string[] = await get('/cookies')
-  // 后端返回的是账号ID数组，转换为Account对象数组
-  return ids.map(id => ({ 
-    id, 
-    cookie: '', 
-    enabled: true,
-    use_ai_reply: false,
-    use_default_reply: false,
-    auto_confirm: false
-  }))
+  try {
+    const details = await getAccountDetails()
+    return details.map(d => ({
+      id: d.id,
+      cookie: d.cookie,
+      enabled: d.enabled,
+      use_ai_reply: false,
+      use_default_reply: false,
+      auto_confirm: d.auto_confirm,
+      note: d.note,
+      pause_duration: d.pause_duration,
+    }))
+  } catch {
+    const ids: string[] = await get('/cookies')
+    return ids.map(id => ({
+      id,
+      cookie: '',
+      enabled: true,
+      use_ai_reply: false,
+      use_default_reply: false,
+      auto_confirm: false,
+    }))
+  }
 }
 
 // 获取账号详情列表

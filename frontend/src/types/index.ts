@@ -4,6 +4,9 @@ export interface User {
   username: string
   is_admin: boolean
   email?: string
+  expires_at?: number | null   // 账号到期时间戳（秒）；null=永久
+  register_ip?: string | null
+  created_at?: string
 }
 
 export interface LoginRequest {
@@ -63,6 +66,8 @@ export interface Item {
   id: string | number
   cookie_id: string
   item_id: string
+  pic_url?: string | null
+  publish_time?: number | null
   title?: string
   item_title?: string
   desc?: string
@@ -107,6 +112,9 @@ export interface Order {
   is_bargain?: boolean
   created_at?: string
   updated_at?: string
+  // 由后端 JOIN item_info 注入
+  pic_url?: string | null
+  item_title?: string | null
 }
 
 export type OrderStatus = 
@@ -147,6 +155,9 @@ export interface DeliveryRule {
   is_multi_spec?: boolean
   spec_name?: string
   spec_value?: string
+  item_id?: string | null
+  /** 满赠梯度，格式："10:1,20:2"（购买>=10送1，>=20送2） */
+  bonus_tiers?: string | null
   created_at?: string
   updated_at?: string
 }

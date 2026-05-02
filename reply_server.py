@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Form
+from fastapi import FastAPI, HTTPException, Depends, status, UploadFile, File, Form, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, StreamingResponse
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -42,8 +42,82 @@ KEYWORDS_FILE = Path(__file__).parent / "回复关键字.txt"
 # 简单的用户认证配置
 ADMIN_USERNAME = "admin"
 DEFAULT_ADMIN_PASSWORD = "admin123"  # 系统初始化时的默认密码
-SESSION_TOKENS = {}  # 存储会话token: {token: {'user_id': int, 'username': str, 'timestamp': float}}
 TOKEN_EXPIRE_TIME = 24 * 60 * 60  # token过期时间：24小时
+
+
+class _PersistentSessionDict(dict):
+    """SESSION_TOKENS 的持久化包装：增删改自动同步到 SQLite，进程重启自动恢复"""
+
+    def _persist_set(self, token, data):
+        try:
+            from db_manager import db_manager
+            db_manager.save_session_token(
+                token,
+                int(data.get('user_id', 0)),
+                str(data.get('username', '')),
+                bool(data.get('is_admin', False)),
+                float(data.get('timestamp', 0.0)),
+            )
+        except Exception:
+            pass
+
+    def _persist_del(self, token):
+        try:
+            from db_manager import db_manager
+            db_manager.delete_session_token(token)
+        except Exception:
+            pass
+
+    def __setitem__(self, key, value):
+        super().__setitem__(key, value)
+        self._persist_set(key, value)
+
+    def __delitem__(self, key):
+        super().__delitem__(key)
+        self._persist_del(key)
+
+    def pop(self, key, *args):
+        existed = key in self
+        result = super().pop(key, *args)
+        if existed:
+            self._persist_del(key)
+        return result
+
+    def clear(self):
+        keys = list(self.keys())
+        super().clear()
+        for k in keys:
+            self._persist_del(k)
+
+
+SESSION_TOKENS = _PersistentSessionDict()  # 存储会话token: {token: {'user_id': int, 'username': str, 'timestamp': float}}
+
+
+def _restore_session_tokens():
+    """启动时从 DB 加载未过期的 token，恢复登录态"""
+    try:
+        from db_manager import db_manager
+        rows = db_manager.load_active_session_tokens(TOKEN_EXPIRE_TIME)
+        # 用底层 dict.__setitem__ 避免重复落库
+        for r in rows:
+            dict.__setitem__(SESSION_TOKENS, r['token'], {
+                'user_id': r['user_id'],
+                'username': r['username'],
+                'is_admin': r['is_admin'],
+                'timestamp': r['timestamp'],
+            })
+        if rows:
+            try:
+                logger.info(f"已从数据库恢复 {len(rows)} 个有效会话 token")
+            except Exception:
+                pass
+    except Exception:
+        # 任何错误都不阻塞启动
+        pass
+
+
+# 启动时立刻恢复
+_restore_session_tokens()
 
 # HTTP Bearer认证
 security = HTTPBearer(auto_error=False)
@@ -124,6 +198,40 @@ class LoginResponse(BaseModel):
     user_id: Optional[int] = None
     username: Optional[str] = None
     is_admin: Optional[bool] = None
+    expires_at: Optional[float] = None  # 账号到期时间戳（None=永久）
+
+
+def _get_real_ip(request) -> str:
+    """从 FastAPI Request 中尽可能获取真实 IP（支持 X-Forwarded-For/X-Real-IP）"""
+    try:
+        xff = request.headers.get('x-forwarded-for') or request.headers.get('X-Forwarded-For')
+        if xff:
+            return xff.split(',')[0].strip()
+        xri = request.headers.get('x-real-ip') or request.headers.get('X-Real-IP')
+        if xri:
+            return xri.strip()
+        client = getattr(request, 'client', None)
+        if client and getattr(client, 'host', None):
+            return client.host
+    except Exception:
+        pass
+    return ''
+
+
+def _check_membership_expired(user: Dict[str, Any]) -> Tuple[bool, Optional[float], str]:
+    """检查会员到期。admin 永远不过期。
+    返回 (是否到期, expires_at, 提示信息)
+    """
+    try:
+        if user.get('username') == ADMIN_USERNAME:
+            return False, None, ''
+        from db_manager import db_manager
+        expiry = db_manager.get_user_expiry(user['id'])
+        if expiry is not None and time.time() >= expiry:
+            return True, expiry, '账号已到期，请联系管理员续期或购买周/月/年卡'
+        return False, expiry, ''
+    except Exception:
+        return False, None, ''
 
 
 class ChangePasswordRequest(BaseModel):
@@ -183,16 +291,19 @@ def generate_token() -> str:
 def verify_token(credentials: Optional[HTTPAuthorizationCredentials] = Depends(security)) -> Optional[Dict[str, Any]]:
     """验证token并返回用户信息"""
     if not credentials:
+        logger.warning("verify_token: 缺少 Authorization Header")
         return None
 
     token = credentials.credentials
     if token not in SESSION_TOKENS:
+        logger.warning(f"verify_token: token 不在 SESSION_TOKENS 中 (token前8位={token[:8]}…, 当前内存里 {len(SESSION_TOKENS)} 个有效 token)")
         return None
 
     token_data = SESSION_TOKENS[token]
 
     # 检查token是否过期
     if time.time() - token_data['timestamp'] > TOKEN_EXPIRE_TIME:
+        logger.warning(f"verify_token: token 已过期 (user={token_data.get('username')})")
         del SESSION_TOKENS[token]
         return None
 
@@ -444,6 +555,29 @@ async def get_changelog():
         return {"error": True, "message": f"获取更新日志失败: {str(e)}"}
 
 
+# 401 异常处理：当浏览器顶层导航命中需要鉴权的 API 路由（前端路由名 == API 路由名，例如 /items、/orders）时，
+# 这里把它当作前端路由处理，返回 SPA index.html，由 React Router 接管，避免出现 {"detail":"未授权访问"} 页面。
+from fastapi.responses import JSONResponse as _JSONResponse
+
+@app.exception_handler(401)
+async def _spa_aware_unauthorized(request, exc):
+    accept = (request.headers.get('accept') or '').lower()
+    sec_mode = (request.headers.get('sec-fetch-mode') or '').lower()
+    sec_dest = (request.headers.get('sec-fetch-dest') or '').lower()
+    is_browser_nav = (
+        sec_mode == 'navigate'
+        or sec_dest == 'document'
+        or ('text/html' in accept and 'application/json' not in accept)
+    )
+    if is_browser_nav:
+        index_path = os.path.join(static_dir, 'index.html')
+        if os.path.exists(index_path):
+            with open(index_path, 'r', encoding='utf-8') as f:
+                return HTMLResponse(f.read())
+    detail = getattr(exc, 'detail', '未授权访问')
+    return _JSONResponse(status_code=401, content={"detail": detail})
+
+
 # 服务 React 前端 SPA - 所有前端路由都返回 index.html
 async def serve_frontend():
     """服务 React 前端 SPA"""
@@ -527,6 +661,17 @@ async def login(request: LoginRequest):
         if db_manager.verify_user_password(request.username, request.password):
             user = db_manager.get_user_by_username(request.username)
             if user:
+                # 会员到期检查
+                _expired, _exp_at, _msg = _check_membership_expired(user)
+                if _expired:
+                    logger.warning(f"【{user['username']}#{user['id']}】登录被拒绝：{_msg}")
+                    return LoginResponse(
+                        success=False,
+                        message=_msg,
+                        user_id=user['id'],
+                        username=user['username'],
+                        expires_at=_exp_at,
+                    )
                 # 生成token
                 token = generate_token()
                 SESSION_TOKENS[token] = {
@@ -548,7 +693,8 @@ async def login(request: LoginRequest):
                     message="登录成功",
                     user_id=user['id'],
                     username=user['username'],
-                    is_admin=(user['username'] == ADMIN_USERNAME)
+                    is_admin=(user['username'] == ADMIN_USERNAME),
+                    expires_at=_exp_at,
                 )
 
         logger.warning(f"【{request.username}】登录失败：用户名或密码错误")
@@ -563,6 +709,10 @@ async def login(request: LoginRequest):
 
         user = db_manager.get_user_by_email(request.email)
         if user and db_manager.verify_user_password(user['username'], request.password):
+            _expired, _exp_at, _msg = _check_membership_expired(user)
+            if _expired:
+                logger.warning(f"【{user['username']}#{user['id']}】登录被拒绝：{_msg}")
+                return LoginResponse(success=False, message=_msg, user_id=user['id'], username=user['username'], expires_at=_exp_at)
             # 生成token
             token = generate_token()
             SESSION_TOKENS[token] = {
@@ -580,7 +730,8 @@ async def login(request: LoginRequest):
                 message="登录成功",
                 user_id=user['id'],
                 username=user['username'],
-                is_admin=(user['username'] == ADMIN_USERNAME)
+                is_admin=(user['username'] == ADMIN_USERNAME),
+                expires_at=_exp_at,
             )
 
         logger.warning(f"【{request.email}】邮箱登录失败：邮箱或密码错误")
@@ -610,6 +761,10 @@ async def login(request: LoginRequest):
                 message="用户不存在"
             )
 
+        _expired, _exp_at, _msg = _check_membership_expired(user)
+        if _expired:
+            logger.warning(f"【{user['username']}#{user['id']}】登录被拒绝：{_msg}")
+            return LoginResponse(success=False, message=_msg, user_id=user['id'], username=user['username'], expires_at=_exp_at)
         # 生成token
         token = generate_token()
         SESSION_TOKENS[token] = {
@@ -627,7 +782,8 @@ async def login(request: LoginRequest):
             message="登录成功",
             user_id=user['id'],
             username=user['username'],
-            is_admin=(user['username'] == ADMIN_USERNAME)
+            is_admin=(user['username'] == ADMIN_USERNAME),
+            expires_at=_exp_at,
         )
 
     else:
@@ -641,11 +797,26 @@ async def login(request: LoginRequest):
 @app.get('/verify')
 async def verify(user_info: Optional[Dict[str, Any]] = Depends(verify_token)):
     if user_info:
+        # 顺便检查会员到期，并把到期时间一并返回（admin 永远不过期）
+        from db_manager import db_manager
+        is_admin = user_info['username'] == ADMIN_USERNAME
+        expires_at = None
+        try:
+            if not is_admin:
+                expires_at = db_manager.get_user_expiry(user_info['user_id'])
+                # 已到期则使 token 失效
+                if expires_at is not None and time.time() >= expires_at:
+                    SESSION_TOKENS.pop(user_info.get('_token', ''), None)
+                    return {"authenticated": False, "expired": True, "expires_at": expires_at,
+                            "message": "账号已到期，请联系管理员续期"}
+        except Exception:
+            pass
         return {
             "authenticated": True,
             "user_id": user_info['user_id'],
             "username": user_info['username'],
-            "is_admin": user_info['username'] == ADMIN_USERNAME
+            "is_admin": is_admin,
+            "expires_at": expires_at,
         }
     return {"authenticated": False}
 
@@ -1048,9 +1219,9 @@ async def send_verification_code(request: SendCodeRequest):
         )
 
 
-# 用户注册接口
+# 用户注册接口（同 IP 首次注册赠 1 天体验）
 @app.post('/register')
-async def register(request: RegisterRequest):
+async def register(request: RegisterRequest, http_request: Request):
     from db_manager import db_manager
 
     # 检查注册是否开启
@@ -1091,12 +1262,25 @@ async def register(request: RegisterRequest):
                 message="该邮箱已被注册"
             )
 
+        # 同 IP 首次注册赠送 1 天体验，否则 expires_at = 现在（即注册即到期，需管理员发放）
+        register_ip = _get_real_ip(http_request)
+        same_ip_count = db_manager.count_users_by_register_ip(register_ip) if register_ip else 999
+        now_ts = time.time()
+        if same_ip_count == 0:
+            expires_at = now_ts + 86400  # 1 天体验
+            trial_msg = '，已赠送 1 天体验权益'
+        else:
+            expires_at = now_ts  # 默认到期
+            trial_msg = ''
+
         # 创建用户
-        if db_manager.create_user(request.username, request.email, request.password):
-            logger.info(f"【{request.username}】注册成功")
+        if db_manager.create_user(request.username, request.email, request.password,
+                                  register_ip=register_ip or None,
+                                  expires_at=expires_at):
+            logger.info(f"【{request.username}】注册成功 ip={register_ip} same_ip_count={same_ip_count}{trial_msg}")
             return RegisterResponse(
                 success=True,
-                message="注册成功，请登录"
+                message=f"注册成功{trial_msg}，请登录"
             )
         else:
             logger.error(f"【{request.username}】注册失败: 数据库操作失败")
@@ -4159,6 +4343,12 @@ def create_card(card_data: dict, current_user: Dict[str, Any] = Depends(get_curr
             if not card_data.get('spec_name') or not card_data.get('spec_value'):
                 raise HTTPException(status_code=400, detail="多规格卡券必须提供规格名称和规格值")
 
+        # 成本价清洗
+        _cost = card_data.get('cost_price')
+        try:
+            _cost = float(_cost) if _cost not in (None, '', 'null') else None
+        except (TypeError, ValueError):
+            _cost = None
         card_id = db_manager.create_card(
             name=card_data.get('name'),
             card_type=card_data.get('type'),
@@ -4172,7 +4362,10 @@ def create_card(card_data: dict, current_user: Dict[str, Any] = Depends(get_curr
             is_multi_spec=is_multi_spec,
             spec_name=card_data.get('spec_name') if is_multi_spec else None,
             spec_value=card_data.get('spec_value') if is_multi_spec else None,
-            user_id=user_id
+            user_id=user_id,
+            cost_price=_cost,
+            admin_note=card_data.get('admin_note'),
+            bonus_tiers=card_data.get('bonus_tiers'),
         )
 
         log_with_user('info', f"卡券创建成功: {card_name} (ID: {card_id})", current_user)
@@ -4197,6 +4390,28 @@ def get_card(card_id: int, current_user: Dict[str, Any] = Depends(get_current_us
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@app.post("/cards/reorder")
+def reorder_cards(payload: dict, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """批量调整卡券顺序：payload = {"ids": [id1, id2, ...]} 按数组顺序设 sort_order=1..N"""
+    try:
+        from db_manager import db_manager
+        ids = payload.get('ids') or []
+        if not isinstance(ids, list) or not ids:
+            raise HTTPException(status_code=400, detail="ids 不能为空")
+        try:
+            ids = [int(x) for x in ids]
+        except Exception:
+            raise HTTPException(status_code=400, detail="ids 必须是整数数组")
+        ok = db_manager.reorder_cards(ids, user_id=current_user['user_id'])
+        if not ok:
+            raise HTTPException(status_code=500, detail="排序更新失败")
+        return {"message": "排序已更新", "count": len(ids)}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.put("/cards/{card_id}")
 def update_card(card_id: int, card_data: dict, _: None = Depends(require_auth)):
     """更新卡券"""
@@ -4208,7 +4423,7 @@ def update_card(card_id: int, card_data: dict, _: None = Depends(require_auth)):
             if not card_data.get('spec_name') or not card_data.get('spec_value'):
                 raise HTTPException(status_code=400, detail="多规格卡券必须提供规格名称和规格值")
 
-        success = db_manager.update_card(
+        _kwargs = dict(
             card_id=card_id,
             name=card_data.get('name'),
             card_type=card_data.get('type'),
@@ -4221,8 +4436,20 @@ def update_card(card_id: int, card_data: dict, _: None = Depends(require_auth)):
             delay_seconds=card_data.get('delay_seconds'),
             is_multi_spec=is_multi_spec,
             spec_name=card_data.get('spec_name'),
-            spec_value=card_data.get('spec_value')
+            spec_value=card_data.get('spec_value'),
         )
+        if 'cost_price' in card_data:
+            _cost = card_data.get('cost_price')
+            try:
+                _cost = float(_cost) if _cost not in (None, '', 'null') else None
+            except (TypeError, ValueError):
+                _cost = None
+            _kwargs['cost_price'] = _cost
+        if 'admin_note' in card_data:
+            _kwargs['admin_note'] = card_data.get('admin_note') or None
+        if 'bonus_tiers' in card_data:
+            _kwargs['bonus_tiers'] = card_data.get('bonus_tiers') or None
+        success = db_manager.update_card(**_kwargs)
         if success:
             return {"message": "卡券更新成功"}
         else:
@@ -4320,13 +4547,19 @@ def create_delivery_rule(rule_data: dict, current_user: Dict[str, Any] = Depends
     try:
         from db_manager import db_manager
         user_id = current_user['user_id']
+        _kw = (rule_data.get('keyword') or '').strip()
+        _iid = (rule_data.get('item_id') or '').strip() or None
+        if not _kw and not _iid:
+            raise HTTPException(status_code=400, detail="关键词和商品ID至少要填一个")
         rule_id = db_manager.create_delivery_rule(
-            keyword=rule_data.get('keyword'),
+            keyword=_kw,
             card_id=rule_data.get('card_id'),
             delivery_count=rule_data.get('delivery_count', 1),
             enabled=rule_data.get('enabled', True),
             description=rule_data.get('description'),
-            user_id=user_id
+            user_id=user_id,
+            item_id=_iid,
+            bonus_tiers=rule_data.get('bonus_tiers'),
         )
         return {"id": rule_id, "message": "发货规则创建成功"}
     except Exception as e:
@@ -4354,15 +4587,21 @@ def update_delivery_rule(rule_id: int, rule_data: dict, current_user: Dict[str, 
     try:
         from db_manager import db_manager
         user_id = current_user['user_id']
-        success = db_manager.update_delivery_rule(
+        _kwargs = dict(
             rule_id=rule_id,
             keyword=rule_data.get('keyword'),
             card_id=rule_data.get('card_id'),
             delivery_count=rule_data.get('delivery_count', 1),
             enabled=rule_data.get('enabled', True),
             description=rule_data.get('description'),
-            user_id=user_id
+            user_id=user_id,
         )
+        # item_id / bonus_tiers 仅当客户端显式带上时才更新（含清空为 None）
+        if 'item_id' in rule_data:
+            _kwargs['item_id'] = (rule_data.get('item_id') or None)
+        if 'bonus_tiers' in rule_data:
+            _kwargs['bonus_tiers'] = rule_data.get('bonus_tiers') or None
+        success = db_manager.update_delivery_rule(**_kwargs)
         if success:
             return {"message": "发货规则更新成功"}
         else:
@@ -4381,6 +4620,71 @@ def delete_card(card_id: int, _: None = Depends(require_auth)):
             return {"message": "卡券删除成功"}
         else:
             raise HTTPException(status_code=404, detail="卡券不存在")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ==================== 卡券消费记录 API ====================
+
+@app.get("/card-consumptions")
+def list_card_consumptions(
+    card_id: Optional[int] = None,
+    restored: Optional[bool] = None,
+    search: Optional[str] = None,
+    page: int = 1,
+    page_size: int = 50,
+    current_user: Dict[str, Any] = Depends(get_current_user),
+):
+    """查询当前用户的批量数据卡券消费记录（已售卡券）"""
+    try:
+        from db_manager import db_manager
+        user_id = current_user['user_id']
+        # 管理员可查所有，普通用户只看自己的
+        is_admin = current_user.get('is_admin') or current_user.get('username') == ADMIN_USERNAME
+        scope_uid = None if is_admin else user_id
+        page = max(1, int(page or 1))
+        page_size = max(1, min(500, int(page_size or 50)))
+        offset = (page - 1) * page_size
+        items = db_manager.list_card_consumptions(
+            scope_uid, card_id=card_id, restored=restored, search=search,
+            limit=page_size, offset=offset)
+        total = db_manager.count_card_consumptions(
+            scope_uid, card_id=card_id, restored=restored, search=search)
+        return {"items": items, "total": total, "page": page, "page_size": page_size}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post("/card-consumptions/{consumption_id}/restore")
+def restore_card_consumption(consumption_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """把已售卡券内容退回到卡券（恢复未售卖状态）"""
+    try:
+        from db_manager import db_manager
+        is_admin = current_user.get('is_admin') or current_user.get('username') == ADMIN_USERNAME
+        scope_uid = None if is_admin else current_user['user_id']
+        ok, msg = db_manager.restore_card_consumption(consumption_id, scope_uid)
+        if not ok:
+            raise HTTPException(status_code=400, detail=msg)
+        return {"success": True, "message": msg}
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.delete("/card-consumptions/{consumption_id}")
+def delete_card_consumption(consumption_id: int, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """删除消费记录（不影响已售卡券内容）"""
+    try:
+        from db_manager import db_manager
+        is_admin = current_user.get('is_admin') or current_user.get('username') == ADMIN_USERNAME
+        scope_uid = None if is_admin else current_user['user_id']
+        ok = db_manager.delete_card_consumption(consumption_id, scope_uid)
+        if not ok:
+            raise HTTPException(status_code=404, detail="记录不存在")
+        return {"success": True}
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -4996,6 +5300,86 @@ async def get_logs(lines: int = 200, level: str = None, source: str = None, _: N
         return {"success": False, "message": f"获取日志失败: {str(e)}", "logs": []}
 
 
+@app.get("/risk-control/active")
+async def get_active_risk_control_alerts(
+    current_user: Dict[str, Any] = Depends(get_current_user)
+):
+    """获取当前用户名下账号最新的风控告警（仅未解除的）。
+
+    判定为"需要人工处理"：最近一次风控日志在 24 小时内，且 processing_status != 'success'。
+    返回结构供前端在账号列表 / 仪表盘展示告警与建议。
+    """
+    try:
+        from db_manager import db_manager
+        user_id = current_user['user_id']
+        user_cookies = db_manager.get_all_cookies(user_id) or {}
+
+        alerts = []
+        if not user_cookies:
+            return {"success": True, "data": [], "count": 0}
+
+        with db_manager.lock:
+            cursor = db_manager.conn.cursor()
+            placeholders = ",".join(["?"] * len(user_cookies))
+            cursor.execute(f'''
+                SELECT cookie_id, event_type, event_description, processing_result,
+                       processing_status, error_message, created_at, updated_at
+                FROM risk_control_logs
+                WHERE cookie_id IN ({placeholders})
+                  AND created_at >= datetime('now', '-24 hours')
+                  AND id IN (
+                      SELECT MAX(id) FROM risk_control_logs
+                      WHERE cookie_id IN ({placeholders})
+                      GROUP BY cookie_id
+                  )
+                ORDER BY created_at DESC
+            ''', list(user_cookies.keys()) + list(user_cookies.keys()))
+            rows = cursor.fetchall() or []
+
+        for row in rows:
+            (cid, ev_type, ev_desc, proc_result, proc_status,
+             err_msg, created_at, updated_at) = row
+            if proc_status == 'success':
+                continue  # 已解除
+
+            # 给出快速修复建议
+            ev_text = (ev_desc or '') + ' ' + (err_msg or '') + ' ' + (ev_type or '')
+            ev_text_l = ev_text.lower()
+            if 'session' in ev_text_l or 'session过期' in ev_text:
+                suggestion = '会话已过期，建议在"账号管理"中扫码登录或使用账号密码重新登录该账号。'
+                action = 'qrcode'
+            elif 'face' in ev_text_l or '人脸' in ev_text:
+                suggestion = '需要人脸验证，请在通知渠道（微信/钉钉/邮件等）查看验证链接并完成。'
+                action = 'manual_verify'
+            elif 'captcha' in ev_text_l or '滑块' in ev_text:
+                if proc_status == 'processing':
+                    suggestion = '正在处理滑块验证；如长时间未恢复，请打开"账号管理"重新扫码登录。'
+                else:
+                    suggestion = '滑块验证失败，建议改用扫码登录，或在账号管理中更新 Cookie。'
+                action = 'qrcode'
+            else:
+                suggestion = '账号被风控，建议重新扫码登录或更新 Cookie。'
+                action = 'qrcode'
+
+            alerts.append({
+                'cookie_id': cid,
+                'event_type': ev_type or 'unknown',
+                'event_description': ev_desc or '',
+                'processing_status': proc_status or 'processing',
+                'processing_result': proc_result or '',
+                'error_message': err_msg or '',
+                'last_event_at': created_at,
+                'updated_at': updated_at,
+                'suggestion': suggestion,
+                'action': action,  # qrcode | manual_verify | password
+            })
+
+        return {"success": True, "data": alerts, "count": len(alerts)}
+    except Exception as e:
+        logger.error(f"获取风控告警失败: {e}")
+        return {"success": False, "message": str(e), "data": [], "count": 0}
+
+
 @app.get("/risk-control-logs")
 async def get_risk_control_logs(
     cookie_id: str = None,
@@ -5305,6 +5689,86 @@ def get_all_users(admin_user: Dict[str, Any] = Depends(require_admin)):
     except Exception as e:
         log_with_user('error', f"获取用户信息失败: {str(e)}", admin_user)
         raise HTTPException(status_code=500, detail=str(e))
+
+# ==================== 会员到期管理（管理员） ====================
+
+class ExtendExpiryRequest(BaseModel):
+    days: int
+
+
+@app.post('/admin/users/{user_id}/extend')
+def extend_user_expiry_api(user_id: int, req: ExtendExpiryRequest,
+                           admin_user: Dict[str, Any] = Depends(require_admin)):
+    """在当前到期时间基础上延长 N 天（已过期则从现在开始算）"""
+    from db_manager import db_manager
+    days = int(req.days or 0)
+    if days <= 0:
+        raise HTTPException(status_code=400, detail="天数必须大于 0")
+    new_expiry = db_manager.extend_user_expiry(user_id, days)
+    if new_expiry is None:
+        raise HTTPException(status_code=404, detail="用户不存在或续期失败")
+    log_with_user('info', f"为 user_id={user_id} 续期 {days} 天，新到期={new_expiry}", admin_user)
+    return {"success": True, "expires_at": new_expiry, "days_added": days}
+
+
+class SetExpiryRequest(BaseModel):
+    expires_at: Optional[float] = None  # None 表示设为永久
+
+
+@app.post('/admin/users/{user_id}/expiry')
+def set_user_expiry_api(user_id: int, req: SetExpiryRequest,
+                        admin_user: Dict[str, Any] = Depends(require_admin)):
+    """直接设置用户到期时间戳（None 表示永久）"""
+    from db_manager import db_manager
+    if not db_manager.set_user_expiry(user_id, req.expires_at):
+        raise HTTPException(status_code=404, detail="用户不存在")
+    log_with_user('info', f"设置 user_id={user_id} 到期={req.expires_at}", admin_user)
+    return {"success": True, "expires_at": req.expires_at}
+
+
+# ==================== 权益价格管理（管理员） ====================
+
+@app.get('/entitlement-prices')
+def list_entitlement_prices(_: Dict[str, Any] = Depends(get_current_user)):
+    """获取所有权益档位（已登录用户可见，用于展示购买套餐）"""
+    from db_manager import db_manager
+    return {"items": db_manager.get_entitlement_prices()}
+
+
+class EntitlementPriceUpsert(BaseModel):
+    key: str
+    name: str
+    days: int
+    price: float
+    enabled: bool = True
+    sort_order: int = 0
+
+
+@app.post('/admin/entitlement-prices')
+def upsert_entitlement_price_api(req: EntitlementPriceUpsert,
+                                 admin_user: Dict[str, Any] = Depends(require_admin)):
+    """新增或更新一个权益档位"""
+    from db_manager import db_manager
+    if not (req.key and req.name) or req.days <= 0 or req.price < 0:
+        raise HTTPException(status_code=400, detail="参数无效")
+    ok = db_manager.upsert_entitlement_price(req.key, req.name, req.days, req.price,
+                                             req.enabled, req.sort_order)
+    if not ok:
+        raise HTTPException(status_code=500, detail="写入失败")
+    log_with_user('info', f"upsert 权益档位 {req.key} name={req.name} days={req.days} price={req.price}", admin_user)
+    return {"success": True}
+
+
+@app.delete('/admin/entitlement-prices/{key}')
+def delete_entitlement_price_api(key: str,
+                                 admin_user: Dict[str, Any] = Depends(require_admin)):
+    """删除一个权益档位"""
+    from db_manager import db_manager
+    if not db_manager.delete_entitlement_price(key):
+        raise HTTPException(status_code=404, detail="档位不存在")
+    log_with_user('info', f"删除权益档位 {key}", admin_user)
+    return {"success": True}
+
 
 @app.delete('/admin/users/{user_id}')
 def delete_user(user_id: int, admin_user: Dict[str, Any] = Depends(require_admin)):

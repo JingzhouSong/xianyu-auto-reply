@@ -12,6 +12,7 @@ import { Keywords } from '@/pages/keywords/Keywords'
 import { About } from '@/pages/about/About'
 import { Disclaimer } from '@/pages/disclaimer/Disclaimer'
 import { Cards } from '@/pages/cards/Cards'
+import { SoldCards } from '@/pages/sold-cards/SoldCards'
 import { Delivery } from '@/pages/delivery/Delivery'
 import { NotificationChannels } from '@/pages/notifications/NotificationChannels'
 import { MessageNotifications } from '@/pages/notifications/MessageNotifications'
@@ -19,6 +20,7 @@ import { Settings } from '@/pages/settings/Settings'
 import { ItemReplies } from '@/pages/item-replies/ItemReplies'
 import { ItemSearch } from '@/pages/search/ItemSearch'
 import { Users } from '@/pages/admin/Users'
+import { Subscription } from '@/pages/admin/Subscription'
 import { Logs } from '@/pages/admin/Logs'
 import { RiskLogs } from '@/pages/admin/RiskLogs'
 import { DataManagement } from '@/pages/admin/DataManagement'
@@ -155,6 +157,7 @@ function App() {
           <Route path="keywords" element={<Keywords />} />
           <Route path="item-replies" element={<ItemReplies />} />
           <Route path="cards" element={<Cards />} />
+          <Route path="sold-cards" element={<SoldCards />} />
           <Route path="delivery" element={<Delivery />} />
           <Route path="notification-channels" element={<NotificationChannels />} />
           <Route path="message-notifications" element={<MessageNotifications />} />
@@ -165,6 +168,7 @@ function App() {
 
           {/* Admin routes */}
           <Route path="admin/users" element={<Users />} />
+          <Route path="admin/subscription" element={<Subscription />} />
           <Route path="admin/logs" element={<Logs />} />
           <Route path="admin/risk-logs" element={<RiskLogs />} />
           <Route path="admin/data" element={<DataManagement />} />

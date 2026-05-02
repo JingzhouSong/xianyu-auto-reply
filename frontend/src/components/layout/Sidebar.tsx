@@ -42,6 +42,7 @@ const mainNavItems: NavItem[] = [
   { icon: MessageSquare, label: '自动回复', path: '/keywords' },
   { icon: MessageCircle, label: '指定商品回复', path: '/item-replies' },
   { icon: CreditCard, label: '卡券管理', path: '/cards' },
+  { icon: CreditCard, label: '已售卡券', path: '/sold-cards' },
   { icon: Truck, label: '自动发货', path: '/delivery' },
   { icon: Bell, label: '通知渠道', path: '/notification-channels' },
   { icon: MessageCircle, label: '消息通知', path: '/message-notifications' },
@@ -51,6 +52,7 @@ const mainNavItems: NavItem[] = [
 
 const adminNavItems: NavItem[] = [
   { icon: UserCog, label: '用户管理', path: '/admin/users', adminOnly: true },
+  { icon: CreditCard, label: '会员订阅', path: '/admin/subscription', adminOnly: true },
   { icon: FileText, label: '系统日志', path: '/admin/logs', adminOnly: true },
   { icon: Shield, label: '风控日志', path: '/admin/risk-logs', adminOnly: true },
   { icon: Database, label: '数据管理', path: '/admin/data', adminOnly: true },

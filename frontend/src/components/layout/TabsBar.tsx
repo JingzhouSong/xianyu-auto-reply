@@ -31,6 +31,7 @@ const routeTitles: Record<string, string> = {
   '/item-replies': '指定商品回复',
   '/orders': '订单管理',
   '/cards': '卡券管理',
+  '/sold-cards': '已售卡券',
   '/delivery': '自动发货',
   '/notification-channels': '通知渠道',
   '/message-notifications': '消息通知',

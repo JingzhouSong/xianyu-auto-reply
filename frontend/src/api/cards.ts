@@ -5,7 +5,7 @@ import type { ApiResponse } from '@/types'
 export interface CardData {
   id?: number
   name: string
-  type: 'api' | 'text' | 'data' | 'image'
+  type: 'api' | 'text' | 'data' | 'cred' | 'image'
   description?: string
   enabled?: boolean
   delay_seconds?: number
@@ -23,6 +23,17 @@ export interface CardData {
   text_content?: string
   data_content?: string
   image_url?: string
+  // 成本价（仅后台可见）
+  cost_price?: number | null
+  // 管理员备注（仅后台可见，不会发送给客户）
+  admin_note?: string | null
+  // 满赠梯度（仅 data/cred 类型有意义）— 与发货规则的 bonus_tiers 同格式
+  bonus_tiers?: string | null
+  // 排序（越小越靠前）
+  sort_order?: number
+  // 计算字段：剩余数量 / 已售条数（仅批量类型有意义）
+  remaining_count?: number | null
+  sold_count?: number
   // 后端返回的额外字段
   created_at?: string
   updated_at?: string
@@ -87,4 +98,60 @@ export const addCard = async (
 export const importCards = (accountId: string, data: { item_id: string; content: string }): Promise<ApiResponse> => {
   const cards = data.content.split('\n').map(s => s.trim()).filter(Boolean)
   return addCard(accountId, { item_id: data.item_id, cards })
+}
+
+// ============ 卡券消费记录（已售卡券） ============
+export interface CardConsumption {
+  id: number
+  card_id: number
+  card_name?: string | null
+  content: string
+  rule_id?: number | null
+  order_id?: string | null
+  buyer_id?: string | null
+  cookie_id?: string | null
+  item_id?: string | null
+  user_id?: number | null
+  restored: boolean
+  restored_at?: string | null
+  consumed_at: string
+  sold_price?: string | null
+  cost_price?: number | null
+}
+
+export interface CardConsumptionListResponse {
+  items: CardConsumption[]
+  total: number
+  page: number
+  page_size: number
+}
+
+export const listCardConsumptions = (params: {
+  card_id?: number
+  restored?: boolean
+  search?: string
+  page?: number
+  page_size?: number
+} = {}): Promise<CardConsumptionListResponse> => {
+  const qs = new URLSearchParams()
+  if (params.card_id != null) qs.append('card_id', String(params.card_id))
+  if (params.restored != null) qs.append('restored', String(params.restored))
+  if (params.search) qs.append('search', params.search)
+  if (params.page != null) qs.append('page', String(params.page))
+  if (params.page_size != null) qs.append('page_size', String(params.page_size))
+  const q = qs.toString()
+  return get(`/card-consumptions${q ? '?' + q : ''}`)
+}
+
+export const restoreCardConsumption = (id: number): Promise<{ success: boolean; message?: string }> => {
+  return post(`/card-consumptions/${id}/restore`, {})
+}
+
+export const deleteCardConsumption = (id: number): Promise<{ success: boolean }> => {
+  return del(`/card-consumptions/${id}`)
+}
+
+// 批量调整卡券顺序
+export const reorderCards = (ids: number[]): Promise<ApiResponse> => {
+  return post('/cards/reorder', { ids })
 }

@@ -4,6 +4,7 @@ import { motion } from 'framer-motion'
 import { Mail, RefreshCw, Plus, Trash2, Power, PowerOff, X, Loader2 } from 'lucide-react'
 import { getMessageNotifications, setMessageNotification, getNotificationChannels } from '@/api/notifications'
 import { getAccounts } from '@/api/accounts'
+import { formatAccountId } from '@/utils/accountLabel'
 import { useUIStore } from '@/store/uiStore'
 import { useAuthStore } from '@/store/authStore'
 import { PageLoading } from '@/components/common/Loading'
@@ -186,7 +187,7 @@ export function MessageNotifications() {
               ) : (
                 notifications.map((notification) => (
                   <tr key={`${notification.cookie_id}-${notification.channel_id}`}>
-                    <td className="font-medium text-blue-600 dark:text-blue-400">{notification.cookie_id}</td>
+                    <td className="font-medium text-blue-600 dark:text-blue-400 whitespace-nowrap">{formatAccountId(notification.cookie_id, accounts)}</td>
                     <td className="text-sm">
                       {notification.channel_name || `渠道 ${notification.channel_id}`}
                     </td>
@@ -248,7 +249,7 @@ export function MessageNotifications() {
                       { value: '', label: '请选择账号' },
                       ...accounts.map((account) => ({
                         value: account.id,
-                        label: account.id,
+                        label: account.note ? `${account.id} (${account.note})` : account.id,
                       })),
                     ]}
                     placeholder="请选择账号"

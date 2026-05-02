@@ -1,7 +1,7 @@
 import { useState, useEffect, useRef } from 'react'
 import type { FormEvent, ChangeEvent } from 'react'
-import { Ticket, RefreshCw, Plus, Trash2, X, Loader2, Power, PowerOff, Edit2, Image } from 'lucide-react'
-import { getCards, deleteCard, createCard, updateCard, type CardData } from '@/api/cards'
+import { Ticket, RefreshCw, Plus, Trash2, X, Loader2, Power, PowerOff, Edit2, Image, ArrowUp, ArrowDown } from 'lucide-react'
+import { getCards, deleteCard, createCard, updateCard, reorderCards, type CardData } from '@/api/cards'
 import { useUIStore } from '@/store/uiStore'
 import { PageLoading } from '@/components/common/Loading'
 import { useAuthStore } from '@/store/authStore'
@@ -16,6 +16,7 @@ const cardTypeOptions = [
   { value: 'api', label: 'API接口' },
   { value: 'text', label: '固定文字' },
   { value: 'data', label: '批量数据' },
+  { value: 'cred', label: '批量账密' },
   { value: 'image', label: '图片' },
 ]
 
@@ -30,6 +31,7 @@ const cardTypeBadge: Record<string, string> = {
   api: 'badge-info',
   text: 'badge-success',
   data: 'badge-warning',
+  cred: 'badge-warning',
   image: 'badge-primary',
 }
 
@@ -38,6 +40,7 @@ const cardTypeLabels: Record<string, string> = {
   api: 'API',
   text: '文本',
   data: '批量',
+  cred: '账密',
   image: '图片',
 }
 
@@ -56,7 +59,7 @@ const postParams = [
 
 interface CardFormData {
   name: string
-  type: 'api' | 'text' | 'data' | 'image' | ''
+  type: 'api' | 'text' | 'data' | 'cred' | 'image' | ''
   // API 配置
   apiUrl: string
   apiMethod: 'GET' | 'POST'
@@ -73,6 +76,11 @@ interface CardFormData {
   // 通用配置
   delaySeconds: number
   description: string
+  // 成本价 / 管理员备注（仅后台可见）
+  costPrice: string
+  adminNote: string
+  // 满赠梯度（仅 data/cred 有意义）
+  bonusTiers: string
   // 多规格配置
   isMultiSpec: boolean
   specName: string
@@ -93,6 +101,9 @@ const initialFormData: CardFormData = {
   imageUrl: '',
   delaySeconds: 0,
   description: '',
+  costPrice: '',
+  adminNote: '',
+  bonusTiers: '',
   isMultiSpec: false,
   specName: '',
   specValue: '',
@@ -113,6 +124,22 @@ export function Cards() {
   // 图片预览弹窗状态
   const [isImagePreviewOpen, setIsImagePreviewOpen] = useState(false)
   const [previewImageUrl, setPreviewImageUrl] = useState('')
+
+  const moveCard = async (idx: number, delta: -1 | 1) => {
+    const target = idx + delta
+    if (target < 0 || target >= cards.length) return
+    const next = cards.slice()
+    const tmp = next[idx]
+    next[idx] = next[target]
+    next[target] = tmp
+    setCards(next)
+    try {
+      await reorderCards(next.map(c => Number(c.id)).filter(Boolean) as number[])
+    } catch (e) {
+      addToast({ type: 'error', message: '排序保存失败' })
+      loadCards()
+    }
+  }
 
   const loadCards = async () => {
     if (!_hasHydrated || !isAuthenticated || !token) return
@@ -171,6 +198,9 @@ export function Cards() {
       imageUrl: card.image_url || '',
       delaySeconds: card.delay_seconds || 0,
       description: card.description || '',
+      costPrice: card.cost_price != null ? String(card.cost_price) : '',
+      adminNote: card.admin_note || '',
+      bonusTiers: card.bonus_tiers || '',
       isMultiSpec: card.is_multi_spec || false,
       specName: card.spec_name || '',
       specValue: card.spec_value || '',
@@ -247,6 +277,10 @@ export function Cards() {
       addToast({ type: 'warning', message: '请输入批量数据' })
       return false
     }
+    if (formData.type === 'cred' && !formData.dataContent.trim()) {
+      addToast({ type: 'warning', message: '请输入批量账密数据' })
+      return false
+    }
     if (formData.type === 'image' && !formData.imageFile && !formData.imageUrl) {
       addToast({ type: 'warning', message: '请选择图片' })
       return false
@@ -293,15 +327,19 @@ export function Cards() {
         imageUrl = uploadResult.image_url
       }
 
+      const _cost = formData.costPrice.trim()
       const cardData: Parameters<typeof createCard>[0] = {
         name: formData.name.trim(),
-        type: formData.type as 'api' | 'text' | 'data' | 'image',
+        type: formData.type as 'api' | 'text' | 'data' | 'cred' | 'image',
         description: formData.description.trim() || undefined,
         enabled: true,
         delay_seconds: formData.delaySeconds,
         is_multi_spec: formData.isMultiSpec,
         spec_name: formData.isMultiSpec ? formData.specName.trim() : undefined,
         spec_value: formData.isMultiSpec ? formData.specValue.trim() : undefined,
+        cost_price: _cost === '' ? null : Number(_cost),
+        admin_note: formData.adminNote.trim() || null,
+        bonus_tiers: (formData.type === 'data' || formData.type === 'cred') ? (formData.bonusTiers.trim() || null) : null,
       }
 
       // 根据类型设置内容
@@ -315,7 +353,7 @@ export function Cards() {
         }
       } else if (formData.type === 'text') {
         cardData.text_content = formData.textContent.trim()
-      } else if (formData.type === 'data') {
+      } else if (formData.type === 'data' || formData.type === 'cred') {
         cardData.data_content = formData.dataContent.trim()
       } else if (formData.type === 'image') {
         cardData.image_url = imageUrl
@@ -393,11 +431,15 @@ export function Cards() {
           <table className="table-ios">
             <thead>
               <tr>
+                <th style={{ width: 60 }}>排序</th>
                 <th>名称</th>
                 <th>类型</th>
                 <th>内容预览</th>
+                <th>剩余 / 已售</th>
+                <th>成本价</th>
                 <th>延时</th>
                 <th>规格</th>
+                <th>管理员备注</th>
                 <th>状态</th>
                 <th>操作</th>
               </tr>
@@ -405,7 +447,7 @@ export function Cards() {
             <tbody>
               {cards.length === 0 ? (
                 <tr>
-                  <td colSpan={7} className="text-center py-8 text-gray-500">
+                  <td colSpan={11} className="text-center py-8 text-gray-500">
                     <div className="flex flex-col items-center gap-2">
                       <Ticket className="w-12 h-12 text-gray-300" />
                       <p>暂无卡券数据</p>
@@ -413,8 +455,30 @@ export function Cards() {
                   </td>
                 </tr>
               ) : (
-                cards.map((card) => (
+                cards.map((card, idx) => (
                   <tr key={card.id}>
+                    <td>
+                      <div className="flex flex-col">
+                        <button
+                          type="button"
+                          disabled={idx === 0}
+                          onClick={() => moveCard(idx, -1)}
+                          className="p-0.5 disabled:opacity-30 hover:text-blue-500"
+                          title="上移"
+                        >
+                          <ArrowUp className="w-3.5 h-3.5" />
+                        </button>
+                        <button
+                          type="button"
+                          disabled={idx === cards.length - 1}
+                          onClick={() => moveCard(idx, 1)}
+                          className="p-0.5 disabled:opacity-30 hover:text-blue-500"
+                          title="下移"
+                        >
+                          <ArrowDown className="w-3.5 h-3.5" />
+                        </button>
+                      </div>
+                    </td>
                     <td className="font-medium">{card.name}</td>
                     <td>
                       <span className={cardTypeBadge[card.type] || 'badge-gray'}>
@@ -446,6 +510,23 @@ export function Cards() {
                         </code>
                       )}
                     </td>
+                    <td>
+                      {(card.type === 'data' || card.type === 'cred') ? (
+                        <span className="text-xs whitespace-nowrap">
+                          <span className={"inline-block px-1.5 py-0.5 rounded " + ((card.remaining_count ?? 0) > 0 ? 'bg-emerald-100 text-emerald-700 dark:bg-emerald-900/30 dark:text-emerald-300' : 'bg-rose-100 text-rose-700 dark:bg-rose-900/30 dark:text-rose-300')}>
+                            剩 {card.remaining_count ?? 0}
+                          </span>
+                          <span className="ml-1 text-slate-500">/ 已售 {card.sold_count ?? 0}</span>
+                        </span>
+                      ) : (
+                        <span className="text-gray-400">-</span>
+                      )}
+                    </td>
+                    <td className="text-xs">
+                      {card.cost_price != null
+                        ? <span className="text-amber-600 dark:text-amber-400">¥{Number(card.cost_price).toFixed(2)}</span>
+                        : <span className="text-gray-400">-</span>}
+                    </td>
                     <td>{card.delay_seconds || 0}秒</td>
                     <td>
                       {card.is_multi_spec ? (
@@ -453,6 +534,9 @@ export function Cards() {
                       ) : (
                         <span className="text-gray-400">-</span>
                       )}
+                    </td>
+                    <td className="text-xs text-slate-500 max-w-[180px] truncate" title={card.admin_note || ''}>
+                      {card.admin_note ? card.admin_note : <span className="text-gray-400">-</span>}
                     </td>
                     <td>
                       {card.enabled ? (
@@ -641,6 +725,25 @@ export function Cards() {
                   </div>
                 )}
 
+                {/* 批量账密配置 */}
+                {formData.type === 'cred' && (
+                  <div className="border border-gray-200 dark:border-gray-700 rounded-lg p-4">
+                    <h3 className="font-medium text-gray-900 dark:text-white mb-3">批量账密配置</h3>
+                    <div>
+                      <label className="input-label">账密内容 (一行一个账号)</label>
+                      <textarea
+                        value={formData.dataContent}
+                        onChange={(e) => updateFormField('dataContent', e.target.value)}
+                        className="input-ios h-40 font-mono text-sm"
+                        placeholder={'每行一条账密，支持以下常见分隔符：空格 / | / , / ; / Tab / -\nuser1 pass1\nuser2|pass2\nuser3,pass3,备注\nuser4\tpass4'}
+                      />
+                      <p className="text-xs text-gray-500 mt-1">
+                        发货时会自动拆分为 <code className="bg-gray-100 dark:bg-gray-800 px-1 rounded">账号：xxx</code> / <code className="bg-gray-100 dark:bg-gray-800 px-1 rounded">密码：yyy</code>（第三列作为备注）
+                      </p>
+                    </div>
+                  </div>
+                )}
+
                 {/* 图片配置 */}
                 {formData.type === 'image' && (
                   <div className="border border-gray-200 dark:border-gray-700 rounded-lg p-4">
@@ -686,9 +789,44 @@ export function Cards() {
                   <p className="text-xs text-gray-500 mt-1">设置自动发货的延时时间，0表示立即发货，最大3600秒(1小时)</p>
                 </div>
 
-                {/* 备注信息 */}
+                {/* 满赠梯度（仅批量类型显示） */}
+                {(formData.type === 'data' || formData.type === 'cred') && (
+                  <div>
+                    <label className="input-label">满赠梯度（买X赠Y，可选）</label>
+                    <input
+                      type="text"
+                      value={formData.bonusTiers}
+                      onChange={(e) => updateFormField('bonusTiers', e.target.value)}
+                      className="input-ios"
+                      placeholder="如 10:1, 20:3, 50:8"
+                    />
+                    <p className="text-xs text-gray-500 mt-1">
+                      默认 1倍（买 N 发 N 件）。填写梯度后，购买数量达到某档会额外赠送。
+                      例如 <code className="bg-gray-100 dark:bg-gray-800 px-1 rounded">10:1,20:3</code> 表示：买10件发11件，买20件发23件。多档用逗号分隔。
+                    </p>
+                  </div>
+                )}
+
+                {/* 成本价 */}
+                <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                  <div>
+                    <label className="input-label">成本价（元，可选）</label>
+                    <input
+                      type="number"
+                      step="0.01"
+                      min={0}
+                      value={formData.costPrice}
+                      onChange={(e) => updateFormField('costPrice', e.target.value)}
+                      className="input-ios"
+                      placeholder="如 9.9"
+                    />
+                    <p className="text-xs text-gray-500 mt-1">仅后台可见，用于在「已售卡券」中计算利润</p>
+                  </div>
+                </div>
+
+                {/* 备注信息（会发送给客户） */}
                 <div>
-                  <label className="input-label">备注信息</label>
+                  <label className="input-label">备注信息（会发给客户）</label>
                   <textarea
                     value={formData.description}
                     onChange={(e) => updateFormField('description', e.target.value)}
@@ -696,8 +834,19 @@ export function Cards() {
                     placeholder="可选的备注信息，支持变量替换：&#10;{DELIVERY_CONTENT} - 发货内容"
                   />
                   <p className="text-xs text-gray-500 mt-1">
-                    备注内容会与发货内容一起发送。使用 <code className="bg-gray-100 dark:bg-gray-800 px-1 rounded">{'{DELIVERY_CONTENT}'}</code> 变量可以在备注中插入实际的发货内容。
+                    备注内容会与发货内容一起发送给客户。使用 <code className="bg-gray-100 dark:bg-gray-800 px-1 rounded">{'{DELIVERY_CONTENT}'}</code> 变量可以在备注中插入实际的发货内容。
                   </p>
+                </div>
+
+                {/* 管理员备注（不发送给客户） */}
+                <div>
+                  <label className="input-label">管理员备注（仅后台可见）</label>
+                  <textarea
+                    value={formData.adminNote}
+                    onChange={(e) => updateFormField('adminNote', e.target.value)}
+                    className="input-ios h-16"
+                    placeholder="仅供后台参考使用，不会发送给客户。例如进货渠道、成本明细、供货商联系方式等。"
+                  />
                 </div>
 
                 {/* 多规格设置 */}

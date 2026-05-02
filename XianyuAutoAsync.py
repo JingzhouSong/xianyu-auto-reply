@@ -848,6 +848,112 @@ class XianyuLive:
         else:
             logger.warning(f"【{self.cookie_id}】订单状态处理器为None，跳过自动发货状态更新: {order_id}")
 
+    async def _log_pending_ship_orders_summary(self):
+        """连接成功后异步上报"待发货"订单统计——只读、不主动重发，防止超发。
+
+        作用：
+        1. 让用户感知到当前账号下还有多少 pending_ship 订单
+        2. 对每条订单做一次"是否已发货"的持久化校验，并在 DB 层把状态修正为 shipped
+           （仅当：DB 中已存在对应订单的未恢复卡券消费记录），避免后续被错误重发
+        3. 不发任何消息给买家，不调用任何外部接口
+        """
+        # 等待 init 完成、避免和首次消息处理抢锁
+        try:
+            await asyncio.sleep(8)
+        except asyncio.CancelledError:
+            return
+        try:
+            from db_manager import db_manager
+            # 只看最近 7 天的待发货订单（避免误处理历史脏数据）
+            from datetime import datetime, timedelta
+            cutoff = (datetime.now() - timedelta(days=7)).strftime('%Y-%m-%d %H:%M:%S')
+
+            # 直接走只读 SQL（避免拉全部订单）
+            with db_manager.lock:
+                cur = db_manager.conn.cursor()
+                cur.execute(
+                    """
+                    SELECT order_id, item_id, buyer_id, quantity, amount, created_at
+                    FROM orders
+                    WHERE cookie_id = ? AND order_status = 'pending_ship'
+                      AND created_at >= ?
+                    ORDER BY created_at DESC
+                    LIMIT 200
+                    """,
+                    (self.cookie_id, cutoff),
+                )
+                rows = cur.fetchall() or []
+
+            if not rows:
+                logger.info(f"【{self.cookie_id}】📦 待发货订单巡检：近 7 天无待发货订单")
+                return
+
+            # 拿到所有相关订单的卡券消费记录（一次性查，减少调用）
+            order_ids = [r[0] for r in rows]
+            consumed_order_ids: set = set()
+            try:
+                with db_manager.lock:
+                    cur = db_manager.conn.cursor()
+                    placeholders = ",".join(["?"] * len(order_ids))
+                    cur.execute(
+                        f"""
+                        SELECT DISTINCT order_id FROM card_consumption_log
+                        WHERE COALESCE(restored, 0) = 0 AND order_id IN ({placeholders})
+                        """,
+                        order_ids,
+                    )
+                    consumed_order_ids = {row[0] for row in (cur.fetchall() or []) if row[0]}
+            except Exception as _ce:
+                logger.warning(f"【{self.cookie_id}】巡检：查询卡券消费记录失败（仅影响修正，不影响安全）：{self._safe_str(_ce)}")
+
+            ghost_pending = []   # 实际已发但 DB 仍标待发货
+            real_pending = []    # 真正待发货
+            for order_id, item_id, buyer_id, quantity, amount, created_at in rows:
+                if order_id in consumed_order_ids:
+                    ghost_pending.append((order_id, item_id))
+                else:
+                    real_pending.append((order_id, item_id, buyer_id, quantity, amount, created_at))
+
+            # 修正"幽灵待发货"的订单状态为 shipped（已有消费记录但状态没更新到位）
+            fixed_count = 0
+            if ghost_pending and self.order_status_handler:
+                for order_id, _item_id in ghost_pending:
+                    try:
+                        ok = self.order_status_handler.handle_auto_delivery_order_status(
+                            order_id=order_id,
+                            cookie_id=self.cookie_id,
+                            context="巡检修正：已存在卡券消费记录"
+                        )
+                        if ok:
+                            fixed_count += 1
+                            # 同步内存防重复集合
+                            self.delivery_sent_orders.add(order_id)
+                    except Exception as _fe:
+                        logger.warning(f"【{self.cookie_id}】巡检：修正订单 {order_id} 状态失败：{self._safe_str(_fe)}")
+
+            logger.warning(
+                f"【{self.cookie_id}】📦 待发货订单巡检完成："
+                f"近 7 天 pending_ship 共 {len(rows)} 条；"
+                f"其中已有卡券消费记录 {len(ghost_pending)} 条（已修正状态 {fixed_count} 条），"
+                f"真实待发货 {len(real_pending)} 条"
+            )
+            # 把真正还没发的订单列出来，便于人工核查
+            if real_pending:
+                _preview = real_pending[:10]
+                _lines = "; ".join(
+                    f"{oid}(item={iid},qty={q})" for oid, iid, _bid, q, _amt, _ct in _preview
+                )
+                logger.warning(
+                    f"【{self.cookie_id}】📦 真实待发货前 {len(_preview)} 条："
+                    f" {_lines}"
+                )
+                logger.warning(
+                    f"【{self.cookie_id}】📦 注意：本巡检不主动重发以防超发；"
+                    f"等待买家进入会话或闲鱼系统再次推送催发货消息时，将由现有自动发货流程处理。"
+                )
+        except Exception as e:
+            logger.warning(f"【{self.cookie_id}】待发货订单巡检异常（已忽略）：{self._safe_str(e)}")
+
     async def _delayed_lock_release(self, lock_key: str, delay_minutes: int = 10):
         """
         延迟释放锁的异步任务
@@ -1141,6 +1247,49 @@ class XianyuLive:
                     logger.info(f'[{msg_time}] 【{self.cookie_id}】订单 {order_id} 在获取锁后检查发现仍在冷却期，跳过发货')
                     return
 
+                # 第五重检查（持久化幂等性，防止重启后重复发货 / 防止超发）
+                # 任意以下条件命中即跳过：
+                #   a) DB 中订单状态不是 pending_ship（已发货/已完成/已关闭/退款中等）
+                #   b) DB 中已存在该订单的卡券消费记录（restored=0，未恢复）
+                try:
+                    from db_manager import db_manager
+                    _existing_order = db_manager.get_order_by_id(order_id)
+                    if _existing_order:
+                        _status = (_existing_order.get('order_status') or '').strip()
+                        if _status and _status not in ('pending_ship', 'processing', 'unknown', ''):
+                            logger.warning(
+                                f'[{msg_time}] 【{self.cookie_id}】🛡️ 持久化幂等性检查命中：'
+                                f'订单 {order_id} 当前状态为 {_status}，不再发货（防超发）'
+                            )
+                            # 同步内存标记，避免后续短时间内重复触发
+                            self.delivery_sent_orders.add(order_id)
+                            self.last_delivery_time[order_id] = time.time()
+                            return
+
+                    # 卡券消费记录幂等性检查（仅对 batch_data 类型有意义，但作为兜底全局检查）
+                    try:
+                        _existing_consumptions = db_manager.list_card_consumptions(
+                            user_id=None, restored=False, limit=10, offset=0,
+                            search=str(order_id)
+                        )
+                        # 严格匹配 order_id（search 是模糊匹配，需再过滤）
+                        _hit = [c for c in (_existing_consumptions or [])
+                                if str(c.get('order_id') or '') == str(order_id)
+                                and not c.get('restored')]
+                        if _hit:
+                            logger.warning(
+                                f'[{msg_time}] 【{self.cookie_id}】🛡️ 持久化幂等性检查命中：'
+                                f'订单 {order_id} 已存在 {len(_hit)} 条未恢复的卡券消费记录，'
+                                f'判定为已发货，跳过（防超发）'
+                            )
+                            self.delivery_sent_orders.add(order_id)
+                            self.last_delivery_time[order_id] = time.time()
+                            return
+                    except Exception as _ce:
+                        logger.warning(f'[{msg_time}] 【{self.cookie_id}】卡券消费幂等性检查异常（不阻断发货）：{self._safe_str(_ce)}')
+                except Exception as _ie:
+                    logger.warning(f'[{msg_time}] 【{self.cookie_id}】持久化幂等性检查异常（不阻断发货）：{self._safe_str(_ie)}')
+
                 # 构造用户URL
                 user_url = f'https://www.goofish.com/personal?userId={send_user_id}'
 
@@ -1151,36 +1300,52 @@ class XianyuLive:
 
                     logger.info(f"【{self.cookie_id}】准备自动发货: item_id={item_id}, item_title={item_title}")
 
-                    # 检查是否需要多数量发货
+                    # 计算实际发送数量：默认 1 倍（=订单购买数量），叠加规则/卡券的满赠梯度
                     from db_manager import db_manager
-                    quantity_to_send = 1  # 默认发送1个
+                    quantity_to_send = 1  # 默认 1
 
-                    # 检查商品是否开启了多数量发货
-                    multi_quantity_delivery = db_manager.get_item_multi_quantity_delivery_status(self.cookie_id, item_id)
-
-                    if multi_quantity_delivery and order_id:
-                        logger.info(f"商品 {item_id} 开启了多数量发货，获取订单详情...")
+                    # 1) 永远尝试读取订单购买数量（不再受 multi_quantity_delivery 开关限制）
+                    order_quantity = 1
+                    if order_id:
                         try:
-                            # 使用现有方法获取订单详情
                             order_detail = await self.fetch_order_detail_info(order_id, item_id, send_user_id)
                             if order_detail and order_detail.get('quantity'):
                                 try:
-                                    order_quantity = int(order_detail['quantity'])
-                                    if order_quantity > 1:
-                                        quantity_to_send = order_quantity
-                                        logger.info(f"从订单详情获取数量: {order_quantity}，将发送 {quantity_to_send} 个卡券")
-                                    else:
-                                        logger.info(f"订单数量为 {order_quantity}，发送单个卡券")
+                                    _q = int(order_detail['quantity'])
+                                    if _q > 0:
+                                        order_quantity = _q
+                                        logger.info(f"订单购买数量: {order_quantity}")
                                 except (ValueError, TypeError):
-                                    logger.warning(f"订单数量格式无效: {order_detail.get('quantity')}，发送单个卡券")
-                            else:
-                                logger.info(f"未获取到订单数量信息，发送单个卡券")
+                                    logger.warning(f"订单数量格式无效: {order_detail.get('quantity')}，按 1 处理")
                         except Exception as e:
-                            logger.error(f"获取订单详情失败: {self._safe_str(e)}，发送单个卡券")
-                    elif not multi_quantity_delivery:
-                        logger.info(f"商品 {item_id} 未开启多数量发货，发送单个卡券")
+                            logger.error(f"获取订单详情失败: {self._safe_str(e)}，按 1 处理")
                     else:
-                        logger.info(f"无订单ID，发送单个卡券")
+                        logger.info(f"无订单ID，按 1 处理")
+
+                    # 2) 默认 1 倍模式：实际发送数量 = 订单购买数量
+                    #    （旧的 multi_quantity_delivery 开关已废弃，保留字段但不再做门槛判断；
+                    #    若需"强制单发"，请使用卡券/规则的 delivery_count = 1 等业务字段）
+                    quantity_to_send = order_quantity
+
+                    # 3) 应用满赠（买X赠Y）梯度：取规则级 + 卡券级的最大档位
+                    try:
+                        _bonus_rules = db_manager.get_delivery_rules_by_keyword(item_title or '', item_id=item_id) or []
+                        _max_bonus = 0
+                        _used_tiers = None
+                        for _r in _bonus_rules:
+                            for _bt in (_r.get('bonus_tiers'), _r.get('card_bonus_tiers')):
+                                if _bt:
+                                    _b = db_manager.compute_bonus(_bt, quantity_to_send)
+                                    if _b > _max_bonus:
+                                        _max_bonus = _b
+                                        _used_tiers = _bt
+                        if _max_bonus > 0:
+                            logger.info(f"满赠梯度命中: 购买 {quantity_to_send} 件，赠送 {_max_bonus} 件 (tiers={_used_tiers})")
+                            quantity_to_send += _max_bonus
+                    except Exception as _be:
+                        logger.warning(f"应用满赠梯度失败（忽略）：{self._safe_str(_be)}")
+
+                    logger.info(f"【{self.cookie_id}】最终发货数量 quantity_to_send={quantity_to_send} (订单数量={order_quantity})")
 
                     # 多次调用自动发货方法，每次获取不同的内容
                     delivery_contents = []
@@ -1191,7 +1356,11 @@ class XianyuLive:
                             # 每次调用都可能获取不同的内容（API卡券、批量数据等）
                             delivery_content = await self._auto_delivery(item_id, item_title, order_id, send_user_id)
                             if delivery_content:
-                                delivery_contents.append(delivery_content)
+                                # _auto_delivery 可能返回 str 或 list[str]（一次配置多种卡券时返回多条）
+                                if isinstance(delivery_content, list):
+                                    delivery_contents.extend(delivery_content)
+                                else:
+                                    delivery_contents.append(delivery_content)
                                 success_count += 1
                                 if quantity_to_send > 1:
                                     logger.info(f"第 {i+1}/{quantity_to_send} 个卡券内容获取成功")
@@ -4674,7 +4843,7 @@ class XianyuLive:
                 # 多规格商品：只匹配多规格发货规则
                 if spec_name and spec_value:
                     logger.info(f"多规格商品，尝试匹配多规格发货规则: {search_text[:50]}... [{spec_name}:{spec_value}]")
-                    delivery_rules = db_manager.get_delivery_rules_by_keyword_and_spec(search_text, spec_name, spec_value)
+                    delivery_rules = db_manager.get_delivery_rules_by_keyword_and_spec(search_text, spec_name, spec_value, item_id=item_id)
                     # 过滤只保留多规格卡券
                     delivery_rules = [r for r in delivery_rules if r.get('is_multi_spec')]
                     
@@ -4689,7 +4858,7 @@ class XianyuLive:
             else:
                 # 非多规格商品：只匹配非多规格发货规则
                 logger.info(f"非多规格商品，尝试匹配普通发货规则: {search_text[:50]}...")
-                delivery_rules = db_manager.get_delivery_rules_by_keyword(search_text)
+                delivery_rules = db_manager.get_delivery_rules_by_keyword(search_text, item_id=item_id)
                 # 过滤只保留非多规格卡券
                 delivery_rules = [r for r in delivery_rules if not r.get('is_multi_spec')]
                 
@@ -4699,19 +4868,16 @@ class XianyuLive:
                     logger.warning(f"❌ 非多规格商品未找到匹配的普通发货规则，跳过自动发货")
                     return None
 
-            # 检查匹配到的卡券数量，只有唯一匹配时才自动发货
-            if len(delivery_rules) > 1:
-                rule_names = [f"{r['card_name']}({r.get('spec_name', '')}:{r.get('spec_value', '')})" if r.get('is_multi_spec') else r['card_name'] for r in delivery_rules]
-                logger.warning(f"❌ 匹配到多个发货规则({len(delivery_rules)}个)，无法确定使用哪个，跳过自动发货: {', '.join(rule_names)}")
-                return None
-
             if not delivery_rules:
                 logger.warning(f"未找到匹配的发货规则: {search_text[:50]}...")
                 return None
 
-            # 使用唯一匹配的规则
-            rule = delivery_rules[0]
-            logger.info(f"✅ 唯一匹配发货规则: {rule['keyword']} -> {rule['card_name']} ({rule['card_type']})")
+            # 允许一次发货绑定多个规则（多种卡券）：遍历所有匹配规则，分别产出内容并合并
+            if len(delivery_rules) > 1:
+                names = [f"{r['card_name']}({r['card_type']})" for r in delivery_rules]
+                logger.info(f"✅ 匹配到 {len(delivery_rules)} 个发货规则，将依次产出：{', '.join(names)}")
+            rule = delivery_rules[0]  # 第一条用作兼容旧日志的引用，主要用于取公共延时
+            logger.info(f"✅ 主匹配发货规则: {rule['keyword']} -> {rule['card_name']} ({rule['card_type']})")
 
             # 保存商品信息到数据库（需要有商品标题才保存）
             # 尝试获取商品标题
@@ -4816,45 +4982,81 @@ class XianyuLive:
                 except Exception as db_e:
                     logger.error(f"保存基本订单信息失败: {self._safe_str(db_e)}")
 
-                # 开始处理发货内容
-                logger.info(f"开始处理发货内容，规则: {rule['keyword']} -> {rule['card_name']} ({rule['card_type']})")
+                # 开始处理发货内容（依次处理所有匹配的规则）
+                produced_contents = []
+                for _rule in delivery_rules:
+                    logger.info(f"开始处理发货内容，规则: {_rule['keyword']} -> {_rule['card_name']} ({_rule['card_type']})")
+                    _content = None
 
-                delivery_content = None
+                    if _rule['card_type'] == 'api':
+                        _content = await self._get_api_card_content(_rule, order_id, item_id, send_user_id, spec_name, spec_value)
+                    elif _rule['card_type'] == 'text':
+                        _content = _rule.get('text_content')
+                    elif _rule['card_type'] == 'data':
+                        _content = db_manager.consume_batch_data(
+                            _rule['card_id'],
+                            rule_id=_rule.get('id'),
+                            order_id=order_id,
+                            buyer_id=send_user_id,
+                            cookie_id=self.cookie_id,
+                            item_id=item_id,
+                        )
+                    elif _rule['card_type'] == 'cred':
+                        raw = db_manager.consume_batch_data(
+                            _rule['card_id'],
+                            rule_id=_rule.get('id'),
+                            order_id=order_id,
+                            buyer_id=send_user_id,
+                            cookie_id=self.cookie_id,
+                            item_id=item_id,
+                        )
+                        if raw:
+                            import re as _re
+                            parts = [p for p in _re.split(r'[\s|,;\t\-]+', raw.strip()) if p]
+                            if len(parts) >= 2:
+                                lines_out = [f"账号：{parts[0]}", f"密码：{parts[1]}"]
+                                for i, ex in enumerate(parts[2:]):
+                                    label = '备注' if i == 0 else f'字段{i + 3}'
+                                    lines_out.append(f"{label}：{ex}")
+                                _content = '\n'.join(lines_out)
+                            else:
+                                _content = raw
+                    elif _rule['card_type'] == 'image':
+                        image_url = _rule.get('image_url')
+                        if image_url:
+                            _content = f"__IMAGE_SEND__{_rule['card_id']}|{image_url}"
+                            logger.info(f"准备发送图片: {image_url} (卡券ID: {_rule['card_id']})")
+                        else:
+                            logger.error(f"图片卡券缺少图片URL: 卡券ID={_rule['card_id']}")
 
-                # 根据卡券类型处理发货内容
-                if rule['card_type'] == 'api':
-                    # API类型：调用API获取内容，传入订单和商品信息用于动态参数替换
-                    delivery_content = await self._get_api_card_content(rule, order_id, item_id, send_user_id, spec_name, spec_value)
-
-                elif rule['card_type'] == 'text':
-                    # 固定文字类型：直接使用文字内容
-                    delivery_content = rule['text_content']
-
-                elif rule['card_type'] == 'data':
-                    # 批量数据类型：获取并消费第一条数据
-                    delivery_content = db_manager.consume_batch_data(rule['card_id'])
-
-                elif rule['card_type'] == 'image':
-                    # 图片类型：返回图片发送标记，包含卡券ID
-                    image_url = rule.get('image_url')
-                    if image_url:
-                        delivery_content = f"__IMAGE_SEND__{rule['card_id']}|{image_url}"
-                        logger.info(f"准备发送图片: {image_url} (卡券ID: {rule['card_id']})")
+                    if _content:
+                        # 处理备注信息和变量替换
+                        _final = self._process_delivery_content_with_description(_content, _rule.get('card_description', ''))
+                        produced_contents.append(_final)
+                        # 增加发货次数统计
+                        try:
+                            db_manager.increment_delivery_times(_rule['id'])
+                        except Exception:
+                            pass
+                        logger.info(f"自动发货内容产出成功: 规则ID={_rule['id']}, 长度={len(_final)}")
                     else:
-                        logger.error(f"图片卡券缺少图片URL: 卡券ID={rule['card_id']}")
-                        delivery_content = None
+                        logger.warning(f"获取发货内容失败: 规则ID={_rule['id']}")
 
-                if delivery_content:
-                    # 处理备注信息和变量替换
-                    final_content = self._process_delivery_content_with_description(delivery_content, rule.get('card_description', ''))
-
-                    # 增加发货次数统计
-                    db_manager.increment_delivery_times(rule['id'])
-                    logger.info(f"自动发货成功: 规则ID={rule['id']}, 内容长度={len(final_content)}")
-                    return final_content
-                else:
-                    logger.warning(f"获取发货内容失败: 规则ID={rule['id']}")
+                if not produced_contents:
+                    logger.warning("所有匹配规则均未产出发货内容")
                     return None
+
+                # 若同时有多条：图片标记必须作为独立条目返回，不能和文本拼接（上层按条目逐一发送）。
+                # 把非图片文本合并为一条，图片条目各自独立；如果只有一条直接返回字符串（兼容旧调用）
+                text_parts = [c for c in produced_contents if not c.startswith("__IMAGE_SEND__")]
+                image_parts = [c for c in produced_contents if c.startswith("__IMAGE_SEND__")]
+                combined = []
+                if text_parts:
+                    combined.append('\n\n'.join(text_parts))
+                combined.extend(image_parts)
+                if len(combined) == 1:
+                    return combined[0]
+                return combined  # type: List[str]
             else:
                 # 没有订单ID，记录日志但不处理发货内容
                 logger.info(f"⚠️ 未检测到订单ID，跳过发货内容处理。规则: {rule['keyword']} -> {rule['card_name']} ({rule['card_type']})")
@@ -7985,6 +8187,12 @@ class XianyuLive:
                             if tasks_started:
                                 logger.info(f"【{self.cookie_id}】✅ 新启动的任务: {', '.join(tasks_started)}")
                             logger.info(f"【{self.cookie_id}】✅ 所有后台任务状态: 心跳(已启动), Token刷新({'运行中' if self.token_refresh_task and not self.token_refresh_task.done() else '已启动'}), 暂停清理({'运行中' if self.cleanup_task and not self.cleanup_task.done() else '已启动'}), Cookie刷新({'运行中' if self.cookie_refresh_task and not self.cookie_refresh_task.done() else '已启动'})")
+
+                            # 启动一次性"待发货订单巡检"——只统计上报，不主动重发，避免超发
+                            try:
+                                self._create_tracked_task(self._log_pending_ship_orders_summary())
+                            except Exception as _e:
+                                logger.warning(f"【{self.cookie_id}】启动待发货订单巡检任务失败（不影响主流程）：{self._safe_str(_e)}")
                             
                             logger.info(f"【{self.cookie_id}】开始监听WebSocket消息...")
                             logger.info(f"【{self.cookie_id}】WebSocket连接状态正常，等待服务器消息...")
