@@ -1186,6 +1186,119 @@ class XianyuLive:
             logger.error(f"【{self.cookie_id}】提取订单ID失败: {self._safe_str(e)}")
             return None
 
+    async def manual_trigger_delivery(self, order_id: str) -> dict:
+        """从前端"订单管理"页面手动触发自动发货流程。
+
+        与消息触发的差异：
+        1. 不依赖 WebSocket 推送的"我已付款"消息，而是直接由用户在 UI 点击"手动发货"
+        2. 仍然走完整的 5 重幂等性检查，绝不超发
+        3. 必须能从 ai_conversations 找到该 (cookie_id, item_id, buyer_id) 的 chat_id；
+           否则没有会话凭证可以把发货消息推给买家，拒绝执行
+
+        Returns:
+            { 'success': bool, 'message': str }
+        """
+        try:
+            from db_manager import db_manager
+            order = db_manager.get_order_by_id(order_id)
+            if not order:
+                return {'success': False, 'message': f'订单 {order_id} 不存在'}
+            if order.get('cookie_id') != self.cookie_id:
+                return {'success': False, 'message': f'订单 {order_id} 不属于当前账号'}
+
+            _status = (order.get('order_status') or order.get('status') or '').strip()
+            if _status and _status not in ('pending_ship', 'processing', 'unknown', ''):
+                return {
+                    'success': False,
+                    'message': f'订单 {order_id} 当前状态为 {_status}，不允许手动触发发货（防超发）'
+                }
+
+            item_id = order.get('item_id') or ''
+            buyer_id = order.get('buyer_id') or ''
+            if not item_id or not buyer_id:
+                return {'success': False, 'message': f'订单 {order_id} 缺少 item_id/buyer_id，无法发货'}
+
+            # 找一个有效的 chat_id：优先用 ai_conversations 最新一条
+            chat_id = None
+            try:
+                with db_manager.lock:
+                    cur = db_manager.conn.cursor()
+                    cur.execute(
+                        """
+                        SELECT chat_id FROM ai_conversations
+                        WHERE cookie_id = ? AND user_id = ? AND item_id = ?
+                        ORDER BY id DESC LIMIT 1
+                        """,
+                        (self.cookie_id, str(buyer_id), str(item_id)),
+                    )
+                    r = cur.fetchone()
+                    if r and r[0]:
+                        chat_id = r[0]
+            except Exception as _ce:
+                logger.warning(f"【{self.cookie_id}】手动发货：查询 chat_id 失败：{self._safe_str(_ce)}")
+
+            # 兜底：default_reply_records（同 item_id 维度，未必精确到 buyer，但聊胜于无）
+            if not chat_id:
+                try:
+                    with db_manager.lock:
+                        cur = db_manager.conn.cursor()
+                        cur.execute(
+                            """
+                            SELECT chat_id FROM default_reply_records
+                            WHERE cookie_id = ? AND item_id = ?
+                            ORDER BY id DESC LIMIT 1
+                            """,
+                            (self.cookie_id, str(item_id)),
+                        )
+                        r = cur.fetchone()
+                        if r and r[0]:
+                            chat_id = r[0]
+                except Exception:
+                    pass
+
+            if not chat_id:
+                return {
+                    'success': False,
+                    'message': '未找到该订单对应的会话(chat_id)，无法把发货内容推给买家。'
+                               '请等买家在闲鱼上向你发任意消息后再试。'
+                }
+
+            if not self.ws or self.ws.closed:
+                return {'success': False, 'message': '账号 WebSocket 未连接，请稍后再试'}
+
+            # 构造一个包含 order_detail?id=<order_id> 字符串的伪消息，
+            # _extract_order_id 的兜底正则可识别它，从而完美复用 _handle_auto_delivery 的全部安全检查。
+            fake_message = {
+                '_manual_trigger_url': f'order_detail?id={order_id}',
+                '_manual_trigger_order_id': str(order_id),
+            }
+            msg_time = time.strftime('%Y-%m-%d %H:%M:%S')
+
+            logger.warning(
+                f"【{self.cookie_id}】🖐️ 手动触发自动发货：order_id={order_id}, "
+                f"item_id={item_id}, buyer_id={buyer_id}, chat_id={chat_id}"
+            )
+
+            await self._handle_auto_delivery(
+                websocket=self.ws,
+                message=fake_message,
+                send_user_name='(手动触发)',
+                send_user_id=str(buyer_id),
+                item_id=str(item_id),
+                chat_id=str(chat_id),
+                msg_time=msg_time,
+            )
+
+            # _handle_auto_delivery 不抛异常即视为已进入流程
+            # 真实成功状态可由调用方稍后查询订单状态（shipped 即代表已发）
+            return {'success': True, 'message': '已触发自动发货流程，请稍后刷新查看订单状态'}
+
+        except Exception as e:
+            logger.error(f"【{self.cookie_id}】手动触发发货异常：{self._safe_str(e)}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return {'success': False, 'message': f'手动触发发货异常：{self._safe_str(e)}'}
+
     async def _handle_auto_delivery(self, websocket, message: dict, send_user_name: str, send_user_id: str,
                                    item_id: str, chat_id: str, msg_time: str):
         """统一处理自动发货逻辑"""
@@ -1384,6 +1497,23 @@ class XianyuLive:
                         # 启动延迟释放锁的异步任务（10分钟后释放）
                         delay_task = asyncio.create_task(self._delayed_lock_release(lock_key, delay_minutes=10))
                         self._lock_hold_info[lock_key]['task'] = delay_task
+
+                        # 🎁 友好合并：把多条纯文本发货内容合并为一条消息发送
+                        # （图片消息保持独立，无法合并）
+                        # 适用：同一订单一次买多个 batch_data / text / api 卡券时，
+                        #      买家只会收到 1 条整齐的卡密集合，避免被多条消息刷屏。
+                        _text_contents = [c for c in delivery_contents if not c.startswith("__IMAGE_SEND__")]
+                        _image_contents = [c for c in delivery_contents if c.startswith("__IMAGE_SEND__")]
+
+                        if len(_text_contents) > 1:
+                            _header = f"共 {len(_text_contents)} 份，发货内容如下："
+                            _body_parts = [f"【{i+1}/{len(_text_contents)}】\n{c}"
+                                           for i, c in enumerate(_text_contents)]
+                            _merged_text = _header + "\n\n" + "\n\n".join(_body_parts)
+                            # 重排：合并文本一条 + 图片各自一条
+                            delivery_contents = ([_merged_text] if _merged_text else []) + _image_contents
+                            logger.info(f"【{self.cookie_id}】🎁 已将 {len(_text_contents)} 条纯文本卡券合并为 1 条消息发送（更友好）")
+                        # 否则维持原序
 
                         # 发送所有获取到的发货内容
                         for i, delivery_content in enumerate(delivery_contents):

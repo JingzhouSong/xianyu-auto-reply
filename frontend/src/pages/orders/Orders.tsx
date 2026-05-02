@@ -1,7 +1,7 @@
 import { useState, useEffect } from 'react'
 import { motion } from 'framer-motion'
-import { ShoppingCart, RefreshCw, Search, Trash2, Eye, X, ChevronLeft, ChevronRight } from 'lucide-react'
-import { getOrders, deleteOrder, getOrderDetail, type OrderDetail } from '@/api/orders'
+import { ShoppingCart, RefreshCw, Search, Trash2, Eye, X, ChevronLeft, ChevronRight, Send } from 'lucide-react'
+import { getOrders, deleteOrder, getOrderDetail, triggerManualDelivery, type OrderDetail } from '@/api/orders'
 import { getAccounts } from '@/api/accounts'
 import { formatAccountId } from '@/utils/accountLabel'
 import { useUIStore } from '@/store/uiStore'
@@ -41,6 +41,8 @@ export function Orders() {
   const [pageSize] = useState(20)
   const [total, setTotal] = useState(0)
   const [totalPages, setTotalPages] = useState(0)
+  // 正在手动触发发货的订单 ID 集合，用于禁用按钮避免重复点击
+  const [deliveringOrderIds, setDeliveringOrderIds] = useState<Set<string>>(new Set())
   const itemMap = useItemMap(_hasHydrated && isAuthenticated && !!token)
 
   const loadOrders = async (page: number = currentPage) => {
@@ -95,6 +97,37 @@ export function Orders() {
       }
     } catch {
       addToast({ type: 'error', message: '删除失败' })
+    }
+  }
+
+  const handleManualDelivery = async (order: Order) => {
+    if (!confirm(
+      `确认对订单 ${order.order_id} 手动触发自动发货？\n\n` +
+      `该操作将：\n` +
+      `• 重新走一次自动发货全流程（匹配卡券、消费批量数据、发送给买家）\n` +
+      `• 受同样的 5 重幂等保护，绝不会超发\n` +
+      `• 仅当订单状态仍为"待发货"时才会实际发货\n\n` +
+      `如果自动发货之前因风控/掉线未成功，可用此功能补救。`
+    )) return
+
+    setDeliveringOrderIds(prev => new Set(prev).add(order.order_id))
+    try {
+      const result = await triggerManualDelivery(order.order_id)
+      if (result.success) {
+        addToast({ type: 'success', message: result.message || '已触发发货流程' })
+        // 延迟 2 秒后刷新，等待后端 shipped 状态写入
+        setTimeout(() => loadOrders(currentPage), 2000)
+      } else {
+        addToast({ type: 'error', message: result.message || '触发失败' })
+      }
+    } catch (e: any) {
+      addToast({ type: 'error', message: e?.message || '触发失败' })
+    } finally {
+      setDeliveringOrderIds(prev => {
+        const next = new Set(prev)
+        next.delete(order.order_id)
+        return next
+      })
     }
   }
 
@@ -288,6 +321,16 @@ export function Orders() {
                           >
                             <Eye className="w-4 h-4 text-blue-500" />
                           </button>
+                          {order.status === 'pending_ship' && (
+                            <button
+                              onClick={() => handleManualDelivery(order)}
+                              disabled={deliveringOrderIds.has(order.order_id)}
+                              className="p-2 rounded-lg hover:bg-emerald-50 dark:hover:bg-emerald-900/20 transition-colors disabled:opacity-40 disabled:cursor-not-allowed"
+                              title="手动触发自动发货（含 5 重幂等保护，不会超发）"
+                            >
+                              <Send className={`w-4 h-4 text-emerald-500 ${deliveringOrderIds.has(order.order_id) ? 'animate-pulse' : ''}`} />
+                            </button>
+                          )}
                           <button
                             onClick={() => handleDelete(order.id)}
                             className="p-2 rounded-lg hover:bg-red-50 dark:hover:bg-red-900/20 transition-colors"

@@ -442,6 +442,14 @@ class DBManager:
                 self._execute_sql(cursor, "ALTER TABLE delivery_rules ADD COLUMN bonus_tiers TEXT")
                 logger.info("delivery_rules 表 bonus_tiers 列添加完成")
 
+            # 兼容旧库：为 cards 添加 bonus_tiers 列（卡券级满赠梯度，与规则级并存，取最大档）
+            try:
+                self._execute_sql(cursor, "SELECT bonus_tiers FROM cards LIMIT 1")
+            except sqlite3.OperationalError:
+                logger.info("正在为 cards 表添加 bonus_tiers 列...")
+                self._execute_sql(cursor, "ALTER TABLE cards ADD COLUMN bonus_tiers TEXT")
+                logger.info("cards 表 bonus_tiers 列添加完成")
+
             # 创建默认回复表（支持账号级别和商品级别）
             cursor.execute('''
             CREATE TABLE IF NOT EXISTS default_replies (
@@ -3396,8 +3404,9 @@ class DBManager:
                    text_content: str = None, data_content: str = None, image_url: str = None,
                    description: str = None, enabled: bool = True, delay_seconds: int = 0,
                    is_multi_spec: bool = False, spec_name: str = None, spec_value: str = None,
-                   user_id: int = None, cost_price: float = None, admin_note: str = None):
-        """创建新卡券（支持多规格）"""
+                   user_id: int = None, cost_price: float = None, admin_note: str = None,
+                   bonus_tiers=None):
+        """创建新卡券（支持多规格；bonus_tiers 为"买X赠Y"梯度字符串，如 "10:1,20:2"）"""
         with self.lock:
             try:
                 # 验证多规格参数
@@ -3443,14 +3452,17 @@ class DBManager:
                     _next_order = cursor.fetchone()[0] or 1
                 except Exception:
                     _next_order = 1
+                _bonus_tiers_norm = self._normalize_bonus_tiers(bonus_tiers) if bonus_tiers else None
                 cursor.execute('''
                 INSERT INTO cards (name, type, api_config, text_content, data_content, image_url,
                                  description, enabled, delay_seconds, is_multi_spec,
-                                 spec_name, spec_value, user_id, cost_price, admin_note, sort_order)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                                 spec_name, spec_value, user_id, cost_price, admin_note, sort_order,
+                                 bonus_tiers)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ''', (name, card_type, api_config_str, text_content, data_content, image_url,
                       description, enabled, delay_seconds, is_multi_spec,
-                      spec_name, spec_value, user_id, cost_price, admin_note, _next_order))
+                      spec_name, spec_value, user_id, cost_price, admin_note, _next_order,
+                      _bonus_tiers_norm))
                 self.conn.commit()
                 card_id = cursor.lastrowid
 
@@ -3474,7 +3486,8 @@ class DBManager:
                            c.spec_name, c.spec_value, c.created_at, c.updated_at,
                            c.cost_price, c.admin_note, COALESCE(c.sort_order, 0) AS sort_order,
                            (SELECT COUNT(1) FROM card_consumption_log l
-                                WHERE l.card_id = c.id AND COALESCE(l.restored, 0) = 0) AS sold_count
+                                WHERE l.card_id = c.id AND COALESCE(l.restored, 0) = 0) AS sold_count,
+                           c.bonus_tiers
                     FROM cards c
                 '''
                 if user_id is not None:
@@ -3521,6 +3534,7 @@ class DBManager:
                         'sort_order': row[17] or 0,
                         'sold_count': int(row[18] or 0),
                         'remaining_count': remaining,
+                        'bonus_tiers': row[19] if len(row) > 19 else None,
                     })
 
                 return cards
@@ -3562,14 +3576,14 @@ class DBManager:
                     cursor.execute('''
                     SELECT id, name, type, api_config, text_content, data_content, image_url,
                            description, enabled, delay_seconds, is_multi_spec,
-                           spec_name, spec_value, created_at, updated_at
+                           spec_name, spec_value, created_at, updated_at, bonus_tiers
                     FROM cards WHERE id = ? AND user_id = ?
                     ''', (card_id, user_id))
                 else:
                     cursor.execute('''
                     SELECT id, name, type, api_config, text_content, data_content, image_url,
                            description, enabled, delay_seconds, is_multi_spec,
-                           spec_name, spec_value, created_at, updated_at
+                           spec_name, spec_value, created_at, updated_at, bonus_tiers
                     FROM cards WHERE id = ?
                     ''', (card_id,))
 
@@ -3600,7 +3614,8 @@ class DBManager:
                         'spec_name': row[11],
                         'spec_value': row[12],
                         'created_at': row[13],
-                        'updated_at': row[14]
+                        'updated_at': row[14],
+                        'bonus_tiers': row[15] if len(row) > 15 else None,
                     }
                 return None
             except Exception as e:
@@ -3611,8 +3626,8 @@ class DBManager:
                    api_config=None, text_content: str = None, data_content: str = None,
                    image_url: str = None, description: str = None, enabled: bool = None,
                    delay_seconds: int = None, is_multi_spec: bool = None, spec_name: str = None,
-                   spec_value: str = None, cost_price=..., admin_note=...):
-        """更新卡券"""
+                   spec_value: str = None, cost_price=..., admin_note=..., bonus_tiers=...):
+        """更新卡券（cost_price / admin_note / bonus_tiers 使用 sentinel ...：未传不更新，传 None 清空）"""
         with self.lock:
             try:
                 # 处理api_config参数
@@ -3673,6 +3688,9 @@ class DBManager:
                 if admin_note is not ...:
                     update_fields.append("admin_note = ?")
                     params.append(admin_note)
+                if bonus_tiers is not ...:
+                    update_fields.append("bonus_tiers = ?")
+                    params.append(self._normalize_bonus_tiers(bonus_tiers) if bonus_tiers else None)
 
                 if not update_fields:
                     return True  # 没有需要更新的字段
@@ -3896,7 +3914,8 @@ class DBManager:
                            c.name as card_name, c.type as card_type, c.api_config,
                            c.text_content, c.data_content, c.image_url, c.enabled as card_enabled, c.description as card_description,
                            c.delay_seconds as card_delay_seconds,
-                           c.is_multi_spec, c.spec_name, c.spec_value, dr.item_id, dr.bonus_tiers
+                           c.is_multi_spec, c.spec_name, c.spec_value, dr.item_id, dr.bonus_tiers,
+                           c.bonus_tiers AS card_bonus_tiers
                     FROM delivery_rules dr
                     LEFT JOIN cards c ON dr.card_id = c.id
                     WHERE dr.enabled = 1 AND c.enabled = 1
@@ -3923,7 +3942,8 @@ class DBManager:
                            c.name as card_name, c.type as card_type, c.api_config,
                            c.text_content, c.data_content, c.image_url, c.enabled as card_enabled, c.description as card_description,
                            c.delay_seconds as card_delay_seconds,
-                           c.is_multi_spec, c.spec_name, c.spec_value, dr.item_id, dr.bonus_tiers
+                           c.is_multi_spec, c.spec_name, c.spec_value, dr.item_id, dr.bonus_tiers,
+                           c.bonus_tiers AS card_bonus_tiers
                     FROM delivery_rules dr
                     LEFT JOIN cards c ON dr.card_id = c.id
                     WHERE dr.enabled = 1 AND c.enabled = 1
@@ -3971,6 +3991,7 @@ class DBManager:
                         'spec_value': row[18],
                         'item_id': row[19] if len(row) > 19 else None,
                         'bonus_tiers': row[20] if len(row) > 20 else None,
+                        'card_bonus_tiers': row[21] if len(row) > 21 else None,
                     })
 
                 return rules
@@ -5562,7 +5583,11 @@ class DBManager:
                         'spec_value': row[4],
                         'quantity': row[5],
                         'amount': row[6],
+                        # 同时返回 status 与 order_status 两个键，避免老调用方依赖 'order_status' 时读到 None
+                        # 这是历史 bug：db 字段叫 order_status，dict 暴露为 status，
+                        # 多处幂等性校验代码用的是 .get('order_status')，导致从未真正生效
                         'status': row[7],
+                        'order_status': row[7],
                         'cookie_id': row[8],
                         'is_bargain': bool(row[9]) if row[9] is not None else False,
                         'created_at': row[10],

@@ -6717,6 +6717,46 @@ def get_order_detail(order_id: str, current_user: Dict[str, Any] = Depends(get_c
         raise HTTPException(status_code=500, detail=f"查询订单详情失败: {str(e)}")
 
 
+@app.post('/api/orders/{order_id}/manual-delivery')
+async def manual_trigger_order_delivery(order_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """手动触发指定订单的自动发货流程（用于自动发货因风控/掉线等原因未生效时补救）。
+
+    安全保证：
+    1. 校验订单归属当前用户
+    2. 调用 XianyuLive.manual_trigger_delivery（内部仍走完整 5 重幂等检查）
+    3. 已发货 / 已关闭 / 退款中等订单一律拒绝
+    """
+    try:
+        from db_manager import db_manager
+        from XianyuAutoAsync import XianyuLive
+
+        user_id = current_user['user_id']
+        order = db_manager.get_order_by_id(order_id)
+        if not order:
+            raise HTTPException(status_code=404, detail='订单不存在')
+
+        cookie_id = order.get('cookie_id')
+        # 校验订单归属
+        user_cookies = db_manager.get_all_cookies(user_id)
+        if cookie_id not in user_cookies:
+            log_with_user('warning', f'手动发货被拒：订单 {order_id} 不属于当前用户', current_user)
+            raise HTTPException(status_code=403, detail='无权操作此订单')
+
+        live_instance = XianyuLive.get_instance(cookie_id)
+        if not live_instance:
+            return {'success': False, 'message': '账号实例未运行，请先在账号管理启用并连接账号'}
+
+        log_with_user('info', f'手动触发订单发货：order_id={order_id}, cookie_id={cookie_id}', current_user)
+        result = await live_instance.manual_trigger_delivery(order_id)
+        return result
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        log_with_user('error', f'手动触发订单发货异常: {e}', current_user)
+        raise HTTPException(status_code=500, detail=f'手动触发发货失败: {e}')
+
+
 @app.delete('/api/orders/{order_id}')
 def delete_order(order_id: str, current_user: Dict[str, Any] = Depends(get_current_user)):
     """删除订单"""

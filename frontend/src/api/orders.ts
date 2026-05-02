@@ -1,4 +1,4 @@
-import { get, del } from '@/utils/request'
+import { get, post, del } from '@/utils/request'
 import type { Order, ApiResponse } from '@/types'
 
 // 订单详情类型
@@ -61,6 +61,19 @@ export const deleteOrder = async (id: string): Promise<ApiResponse> => {
 // 批量删除订单
 export const batchDeleteOrders = async (_ids: string[]): Promise<ApiResponse> => {
   return { success: false, message: '后端暂未实现批量删除订单接口' }
+}
+
+// 手动触发自动发货（用于"待发货"订单的人工补救）
+export const triggerManualDelivery = async (orderId: string): Promise<ApiResponse> => {
+  try {
+    const result = await post<{ success: boolean; message?: string }>(`/api/orders/${orderId}/manual-delivery`)
+    return {
+      success: !!result?.success,
+      message: result?.message || (result?.success ? '已触发发货' : '触发失败'),
+    }
+  } catch (e: any) {
+    return { success: false, message: e?.message || '触发发货失败' }
+  }
 }
 
 // 更新订单状态
