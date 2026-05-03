@@ -1,6 +1,6 @@
 import { useState, useEffect, useRef } from 'react'
-import { Settings as SettingsIcon, Save, Bot, Mail, RefreshCw, Key, Download, Upload, Archive, Eye, EyeOff, Copy } from 'lucide-react'
-import { getSystemSettings, updateSystemSettings, testAIConnection, testEmailSend, changePassword, downloadDatabaseBackup, uploadDatabaseBackup, reloadSystemCache, exportUserBackup, importUserBackup } from '@/api/settings'
+import { Settings as SettingsIcon, Save, Bot, Mail, RefreshCw, Key, Download, Upload, Archive, Eye, EyeOff, Copy, ShieldCheck, Trash2 } from 'lucide-react'
+import { getSystemSettings, updateSystemSettings, testAIConnection, testEmailSend, changePassword, downloadDatabaseBackup, uploadDatabaseBackup, reloadSystemCache, exportUserBackup, importUserBackup, getXianyuEncKeyStatus, updateXianyuEncKey, type XianyuEncKeyStatus } from '@/api/settings'
 import { getAccounts } from '@/api/accounts'
 import { useUIStore } from '@/store/uiStore'
 import { useAuthStore } from '@/store/authStore'
@@ -41,6 +41,16 @@ export function Settings() {
   const [showNewPassword, setShowNewPassword] = useState(false)
   const [showConfirmPassword, setShowConfirmPassword] = useState(false)
 
+  // 闲鱼密码加密密钥状态
+  const [encKeyStatus, setEncKeyStatus] = useState<XianyuEncKeyStatus | null>(null)
+  const [encOldKey, setEncOldKey] = useState('')
+  const [encNewKey, setEncNewKey] = useState('')
+  const [encNewKeyConfirm, setEncNewKeyConfirm] = useState('')
+  const [showEncOldKey, setShowEncOldKey] = useState(false)
+  const [showEncNewKey, setShowEncNewKey] = useState(false)
+  const [encKeySubmitting, setEncKeySubmitting] = useState(false)
+  const [encKeyClearing, setEncKeyClearing] = useState(false)
+
   const loadSettings = async () => {
     if (!_hasHydrated || !isAuthenticated || !token) return
     try {
@@ -56,10 +66,87 @@ export function Settings() {
     }
   }
 
+  const loadEncKeyStatus = async () => {
+    try {
+      const s = await getXianyuEncKeyStatus()
+      setEncKeyStatus(s)
+    } catch {
+      // ignore
+    }
+  }
+
   useEffect(() => {
     if (!_hasHydrated || !isAuthenticated || !token) return
     loadSettings()
+    loadEncKeyStatus()
   }, [_hasHydrated, isAuthenticated, token])
+
+  const handleSaveEncKey = async () => {
+    if (!encNewKey) {
+      addToast({ type: 'warning', message: '请输入新密钥' })
+      return
+    }
+    if (encNewKey.length < 4) {
+      addToast({ type: 'warning', message: '新密钥长度不能少于 4 位' })
+      return
+    }
+    if (encNewKey !== encNewKeyConfirm) {
+      addToast({ type: 'warning', message: '两次输入的新密钥不一致' })
+      return
+    }
+    if (encKeyStatus?.configured && !encOldKey) {
+      addToast({ type: 'warning', message: '请输入原密钥' })
+      return
+    }
+    try {
+      setEncKeySubmitting(true)
+      const res = await updateXianyuEncKey({
+        old_key: encKeyStatus?.configured ? encOldKey : undefined,
+        new_key: encNewKey,
+      })
+      if (res.success) {
+        addToast({ type: 'success', message: res.message || '密钥已保存' })
+        setEncOldKey('')
+        setEncNewKey('')
+        setEncNewKeyConfirm('')
+        await loadEncKeyStatus()
+      } else {
+        addToast({ type: 'error', message: res.message || '保存失败' })
+      }
+    } catch (e: unknown) {
+      const msg = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail || '保存失败'
+      addToast({ type: 'error', message: msg })
+    } finally {
+      setEncKeySubmitting(false)
+    }
+  }
+
+  const handleClearEncKey = async () => {
+    if (!encKeyStatus?.configured) return
+    if (!encOldKey) {
+      addToast({ type: 'warning', message: '请输入原密钥以清除' })
+      return
+    }
+    if (!confirm('确认清除加密密钥？所有闲鱼账号密码将被还原为明文存储。')) return
+    try {
+      setEncKeyClearing(true)
+      const res = await updateXianyuEncKey({ old_key: encOldKey, new_key: '' })
+      if (res.success) {
+        addToast({ type: 'success', message: res.message || '已清除密钥' })
+        setEncOldKey('')
+        setEncNewKey('')
+        setEncNewKeyConfirm('')
+        await loadEncKeyStatus()
+      } else {
+        addToast({ type: 'error', message: res.message || '清除失败' })
+      }
+    } catch (e: unknown) {
+      const msg = (e as { response?: { data?: { detail?: string } } })?.response?.data?.detail || '清除失败'
+      addToast({ type: 'error', message: msg })
+    } finally {
+      setEncKeyClearing(false)
+    }
+  }
 
   const handleSave = async () => {
     if (!settings) return
@@ -676,6 +763,113 @@ export function Settings() {
                 {changingPassword ? <ButtonLoading /> : <Key className="w-4 h-4" />}
                 修改密码
               </button>
+            </div>
+          </div>
+
+          {/* 闲鱼账号密码加密密钥 */}
+          <div className="vben-card">
+            <div className="vben-card-header">
+              <h2 className="vben-card-title">
+                <ShieldCheck className="w-4 h-4" />
+                闲鱼账号密码加密密钥
+              </h2>
+            </div>
+            <div className="vben-card-body space-y-4">
+              <div className="text-xs text-slate-500 dark:text-slate-400 leading-relaxed space-y-1">
+                <p>
+                  设置后，所有闲鱼账号密码将使用该密钥加密存储；查看账号详情时会自动解密展示。未设置时按明文存储（与旧行为兼容）。
+                </p>
+                <p>
+                  <strong>请务必牢记密钥</strong>：密钥只保存在本系统数据库中，遗失后无法找回；修改密钥时必须输入原密钥。
+                </p>
+                {encKeyStatus && (
+                  <p className="pt-1">
+                    当前状态：
+                    <span className={encKeyStatus.configured ? 'text-emerald-600 dark:text-emerald-400 font-medium' : 'text-amber-600 dark:text-amber-400 font-medium'}>
+                      {encKeyStatus.configured ? '已配置' : '未配置（明文存储）'}
+                    </span>
+                    <span className="ml-2 text-slate-400">
+                      闲鱼账号 {encKeyStatus.total_accounts} 个，已加密 {encKeyStatus.encrypted_accounts} 个
+                    </span>
+                  </p>
+                )}
+              </div>
+
+              {encKeyStatus?.configured && (
+                <div className="input-group">
+                  <label className="input-label">原密钥</label>
+                  <div className="relative">
+                    <input
+                      type={showEncOldKey ? 'text' : 'password'}
+                      value={encOldKey}
+                      onChange={(e) => setEncOldKey(e.target.value)}
+                      placeholder="请输入原密钥"
+                      className="input-ios w-full pr-12"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowEncOldKey(!showEncOldKey)}
+                      className="absolute right-2 top-1/2 -translate-y-1/2 p-1.5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300"
+                      title={showEncOldKey ? '隐藏' : '显示'}
+                    >
+                      {showEncOldKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                    </button>
+                  </div>
+                </div>
+              )}
+
+              <div className="input-group">
+                <label className="input-label">{encKeyStatus?.configured ? '新密钥' : '密钥（不少于 4 位）'}</label>
+                <div className="relative">
+                  <input
+                    type={showEncNewKey ? 'text' : 'password'}
+                    value={encNewKey}
+                    onChange={(e) => setEncNewKey(e.target.value)}
+                    placeholder={encKeyStatus?.configured ? '请输入新密钥' : '请输入加密密钥'}
+                    className="input-ios w-full pr-12"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => setShowEncNewKey(!showEncNewKey)}
+                    className="absolute right-2 top-1/2 -translate-y-1/2 p-1.5 text-slate-400 hover:text-slate-600 dark:hover:text-slate-300"
+                    title={showEncNewKey ? '隐藏' : '显示'}
+                  >
+                    {showEncNewKey ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
+                  </button>
+                </div>
+              </div>
+
+              <div className="input-group">
+                <label className="input-label">确认密钥</label>
+                <input
+                  type={showEncNewKey ? 'text' : 'password'}
+                  value={encNewKeyConfirm}
+                  onChange={(e) => setEncNewKeyConfirm(e.target.value)}
+                  placeholder="再次输入以确认"
+                  className="input-ios w-full"
+                />
+              </div>
+
+              <div className="flex flex-wrap gap-2">
+                <button
+                  onClick={handleSaveEncKey}
+                  disabled={encKeySubmitting || encKeyClearing}
+                  className="btn-ios-primary"
+                >
+                  {encKeySubmitting ? <ButtonLoading /> : <ShieldCheck className="w-4 h-4" />}
+                  {encKeyStatus?.configured ? '修改密钥' : '设置密钥'}
+                </button>
+                {encKeyStatus?.configured && (
+                  <button
+                    onClick={handleClearEncKey}
+                    disabled={encKeyClearing || encKeySubmitting}
+                    className="btn-ios-secondary text-red-600 dark:text-red-400"
+                  >
+                    {encKeyClearing ? <ButtonLoading /> : <Trash2 className="w-4 h-4" />}
+                    清除密钥（恢复明文）
+                  </button>
+                )}
+              </div>
             </div>
           </div>
 

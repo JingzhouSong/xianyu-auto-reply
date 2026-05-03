@@ -2846,12 +2846,18 @@ class XianyuLive:
             logger.error(f"保存商品信息到数据库异常: {self._safe_str(e)}")
 
     async def save_item_detail_only(self, item_id, item_detail):
-        """仅保存商品详情（不影响标题等基本信息）"""
+        """仅保存从闲鱼商品页抓取到的【纯文本描述】（不影响标题、图片 JSON 等基本信息）。
+
+        ⚠️ 历史 Bug：此处原本把浏览器抓到的纯文本写入 item_detail 列，直接覆盖了
+        batch_save_item_basic_info 存进去的结构化 JSON（含 pic_info），导致
+        _extract_pic_url 无法解析 → 商品列表页图片空白。
+        修正：写入 item_description 列，保留 item_detail 的 JSON 不被破坏。
+        """
         try:
             from db_manager import db_manager
 
-            # 使用专门的详情更新方法
-            success = db_manager.update_item_detail(self.cookie_id, item_id, item_detail)
+            # 写入 item_description，不再覆盖 item_detail（保留主图 pic_info 结构）
+            success = db_manager.update_item_description(self.cookie_id, item_id, item_detail)
 
             if success:
                 logger.info(f"商品详情已更新: {item_id}")
@@ -4890,10 +4896,12 @@ class XianyuLive:
                     if db_item_info:
                         # 拼接商品标题和详情作为搜索文本
                         item_title_db = db_item_info.get('item_title', '') or ''
-                        item_detail_db = db_item_info.get('item_detail', '') or ''
+                        # item_description 存放浏览器抓取/用户手写的纯文本描述（关键词匹配用这个）
+                        # item_detail 存放含 pic_info 的结构化 JSON（不适合做文本搜索）
+                        item_detail_db = (db_item_info.get('item_description', '') or '').strip()
 
-                        # 如果数据库中没有详情，尝试自动获取
-                        if not item_detail_db.strip():
+                        # 如果数据库中没有描述文本，尝试自动获取
+                        if not item_detail_db:
                             from config import config
                             auto_fetch_config = config.get('ITEM_DETAIL', {}).get('auto_fetch', {})
 

@@ -5,6 +5,7 @@ import type { Item } from '@/types'
 export interface ItemBrief {
   pic_url?: string | null
   item_title?: string | null
+  item_price?: string | null  // 商品标价兜底（订单列表里 JOIN 不到 item_info 时使用）
 }
 
 /**
@@ -32,6 +33,7 @@ export function useItemMap(enabled: boolean) {
             map[String(it.item_id)] = {
               pic_url: it.pic_url || prev?.pic_url || null,
               item_title: it.item_title || it.title || prev?.item_title || null,
+              item_price: it.item_price || it.price || prev?.item_price || null,
             }
           }
         }

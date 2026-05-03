@@ -4,6 +4,7 @@ import { ShoppingCart, RefreshCw, Search, Trash2, Eye, X, ChevronLeft, ChevronRi
 import { getOrders, deleteOrder, getOrderDetail, triggerManualDelivery, type OrderDetail } from '@/api/orders'
 import { getAccounts } from '@/api/accounts'
 import { formatAccountId } from '@/utils/accountLabel'
+import { formatDbDateTime } from '@/utils/datetime'
 import { useUIStore } from '@/store/uiStore'
 import { useAuthStore } from '@/store/authStore'
 import { PageLoading } from '@/components/common/Loading'
@@ -21,7 +22,16 @@ const statusMap: Record<string, { label: string; class: string }> = {
   refunding: { label: '退款中', class: 'badge-warning' },
   refund_cancelled: { label: '退款撤销', class: 'badge-info' },
   cancelled: { label: '已关闭', class: 'badge-danger' },
-  unknown: { label: '未知', class: 'badge-gray' },
+  // 'unknown' 是数据库默认值：订单刚插入、还没被状态处理器更新时就是这个值
+  // （与退款无关；退款用 refunding/refund_cancelled/cancelled）
+  unknown: { label: '待同步', class: 'badge-gray' },
+}
+
+/** 映射订单状态显示；无映射时展示原始字段值，便于排查 */
+const getStatusDisplay = (raw: string | null | undefined): { label: string; class: string } => {
+  const key = (raw ?? '').trim()
+  if (!key) return { label: '-', class: 'badge-gray' }
+  return statusMap[key] ?? { label: key, class: 'badge-gray' }
 }
 
 export function Orders() {
@@ -258,7 +268,8 @@ export function Orders() {
                 <th>商品ID</th>
                 <th>买家ID</th>
                 <th>数量</th>
-                <th>金额</th>
+                <th title="商品标价（来自闲鱼商品页）">标价</th>
+                <th title="买家实付金额（含小刀后价）">实付</th>
                 <th>状态</th>
                 <th>小刀</th>
                 <th>账号ID</th>
@@ -269,7 +280,7 @@ export function Orders() {
             <tbody>
               {filteredOrders.length === 0 ? (
                 <tr>
-                  <td colSpan={11} className="text-center py-8 text-gray-500">
+                  <td colSpan={12} className="text-center py-8 text-gray-500">
                     <div className="flex flex-col items-center gap-2">
                       <ShoppingCart className="w-12 h-12 text-gray-300" />
                       <p>暂无订单数据</p>
@@ -278,7 +289,7 @@ export function Orders() {
                 </tr>
               ) : (
                 filteredOrders.map((order) => {
-                  const status = statusMap[order.status] || statusMap.unknown
+                  const status = getStatusDisplay(order.status)
                   return (
                     <tr key={order.id}>
                       <td className="font-mono text-sm">{order.order_id}</td>
@@ -293,6 +304,15 @@ export function Orders() {
                       <td className="text-sm">{order.item_id}</td>
                       <td className="text-sm">{order.buyer_id}</td>
                       <td>{order.quantity}</td>
+                      <td className="text-slate-500 whitespace-nowrap">
+                        {(() => {
+                          const listed = order.item_price || itemMap[String(order.item_id || '')]?.item_price
+                          if (!listed || !String(listed).trim()) return <span className="text-slate-300">-</span>
+                          // item_price 通常已含 ¥/￥ 前缀，避免重复
+                          const s = String(listed).trim()
+                          return /^[¥￥$]/.test(s) ? s : `¥${s}`
+                        })()}
+                      </td>
                       <td className="text-amber-600 font-medium whitespace-nowrap">
                         {order.amount && String(order.amount).trim()
                           ? <>¥{order.amount}</>
@@ -310,7 +330,7 @@ export function Orders() {
                       </td>
                       <td className="font-medium text-blue-600 dark:text-blue-400 whitespace-nowrap">{formatAccountId(order.cookie_id, accounts)}</td>
                       <td className="text-sm text-gray-500">
-                        {order.created_at ? new Date(order.created_at).toLocaleString('zh-CN') : '-'}
+                        {formatDbDateTime(order.created_at)}
                       </td>
                       <td>
                         <div className="flex items-center gap-1">
@@ -508,11 +528,11 @@ export function Orders() {
                     <div className="grid grid-cols-2 gap-2 text-sm">
                       <div className="flex justify-between py-1 border-b border-gray-100 dark:border-gray-700">
                         <span className="text-gray-500">创建时间</span>
-                        <span>{orderDetail.created_at ? new Date(orderDetail.created_at).toLocaleString('zh-CN') : '未知'}</span>
+                        <span>{formatDbDateTime(orderDetail.created_at, '未知')}</span>
                       </div>
                       <div className="flex justify-between py-1 border-b border-gray-100 dark:border-gray-700">
                         <span className="text-gray-500">更新时间</span>
-                        <span>{orderDetail.updated_at ? new Date(orderDetail.updated_at).toLocaleString('zh-CN') : '未知'}</span>
+                        <span>{formatDbDateTime(orderDetail.updated_at, '未知')}</span>
                       </div>
                     </div>
                   </div>

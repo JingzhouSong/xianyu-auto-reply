@@ -105,6 +105,25 @@ export const changePassword = async (data: { current_password: string; new_passw
   return post('/change-password', data)
 }
 
+// ====== 闲鱼账号密码加密密钥 ======
+export interface XianyuEncKeyStatus {
+  success: boolean
+  configured: boolean
+  total_accounts: number
+  encrypted_accounts: number
+}
+
+export const getXianyuEncKeyStatus = (): Promise<XianyuEncKeyStatus> => {
+  return get('/user/xianyu-encryption-key/status')
+}
+
+export const updateXianyuEncKey = (data: { old_key?: string; new_key?: string }): Promise<ApiResponse & {
+  updated?: number
+  configured?: boolean
+}> => {
+  return post('/user/xianyu-encryption-key', data)
+}
+
 // 获取备份文件列表（管理员）
 export const getBackupList = async (): Promise<{ backups: Array<{ filename: string; size: number; size_mb: number; modified_time: string }>; total: number }> => {
   return get('/admin/backup/list')

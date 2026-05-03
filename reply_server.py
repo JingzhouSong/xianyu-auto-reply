@@ -883,6 +883,114 @@ async def change_user_password(request: ChangePasswordRequest, current_user: Dic
         return {"success": False, "message": "系统错误"}
 
 
+# ====================== 闲鱼账号密码加密密钥 ======================
+class XianyuEncKeyUpdate(BaseModel):
+    """更新/设置/清除闲鱼账号密码加密密钥"""
+    old_key: Optional[str] = None  # 当前密钥（如果之前已设置）
+    new_key: Optional[str] = None  # 新密钥（为空表示清除密钥并将所有闲鱼密码还原为明文）
+
+
+@app.get('/user/xianyu-encryption-key/status')
+async def get_xianyu_encryption_key_status(current_user: Dict[str, Any] = Depends(get_current_user)):
+    """查询当前用户的闲鱼密码加密密钥配置状态（不返回密钥本体）。"""
+    from db_manager import db_manager
+    try:
+        user_id = current_user.get('user_id')
+        key = db_manager.get_user_xianyu_key(user_id)
+        # 统计该用户的闲鱼账号数 / 已加密条数，便于前端展示
+        encrypted_count = 0
+        total_count = 0
+        try:
+            with db_manager.lock:
+                cursor = db_manager.conn.cursor()
+                db_manager._execute_sql(cursor, "SELECT password FROM cookies WHERE user_id = ?", (int(user_id),))
+                for (pw,) in cursor.fetchall():
+                    total_count += 1
+                    if pw and isinstance(pw, str) and pw.startswith("enc::v1::"):
+                        encrypted_count += 1
+        except Exception as _e:
+            logger.error(f"统计闲鱼密码加密状态失败: {_e}")
+        return {
+            "success": True,
+            "configured": bool(key),
+            "total_accounts": total_count,
+            "encrypted_accounts": encrypted_count,
+        }
+    except Exception as e:
+        logger.error(f"查询闲鱼加密密钥状态失败: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.post('/user/xianyu-encryption-key')
+async def update_xianyu_encryption_key(payload: XianyuEncKeyUpdate, current_user: Dict[str, Any] = Depends(get_current_user)):
+    """设置 / 修改 / 清除当前用户的闲鱼密码加密密钥，并自动重加密所有闲鱼账号密码。
+
+    语义：
+    - 当前未配置 + new_key 非空：首次设置，所有明文密码用 new_key 加密；
+    - 当前已配置 + new_key 非空：修改密钥，使用 old_key 解密所有密文，再用 new_key 加密；old_key 必须正确；
+    - 当前已配置 + new_key 为空：清除密钥，使用 old_key 解密所有密文为明文存储；old_key 必须正确；
+    - 当前未配置 + new_key 也为空：无操作。
+    """
+    from db_manager import db_manager
+    try:
+        user_id = current_user.get('user_id')
+        if user_id is None:
+            raise HTTPException(status_code=401, detail="未获取到用户身份")
+
+        current_key = db_manager.get_user_xianyu_key(user_id)
+        old_key = (payload.old_key or '').strip() or None
+        new_key = (payload.new_key or '').strip() or None
+
+        # 校验 old_key
+        if current_key:
+            if not old_key:
+                raise HTTPException(status_code=400, detail="当前已配置加密密钥，请提供原密钥")
+            if old_key != current_key:
+                raise HTTPException(status_code=400, detail="原密钥不正确")
+        else:
+            # 当前未配置；忽略 old_key
+            old_key = None
+
+        if not current_key and not new_key:
+            return {"success": True, "message": "当前未配置密钥，无需操作", "updated": 0}
+
+        # 长度校验：避免空字符串混乱、限定最小 4 位
+        if new_key is not None and len(new_key) < 4:
+            raise HTTPException(status_code=400, detail="新密钥长度不能少于 4 位")
+
+        # 1) 先重加密所有闲鱼密码
+        rekey_result = db_manager.rekey_user_xianyu_passwords(user_id, old_key, new_key)
+        if not rekey_result.get("success"):
+            # 失败时不更新 users.xianyu_enc_key，避免出现密文与密钥不匹配
+            logger.error(f"用户 {user_id} 闲鱼密码批量换密未全部成功: {rekey_result}")
+            return {
+                "success": False,
+                "message": "部分闲鱼账号密码处理失败，密钥未更新",
+                "details": rekey_result,
+            }
+
+        # 2) 再更新 users.xianyu_enc_key
+        ok = db_manager.set_user_xianyu_key(user_id, new_key)
+        if not ok:
+            raise HTTPException(status_code=500, detail="保存加密密钥失败")
+
+        action = "已清除密钥" if not new_key else ("已设置密钥" if not current_key else "已修改密钥")
+        logger.info(f"用户 {user_id} {action}，受影响账号 {rekey_result.get('updated', 0)} 个")
+        return {
+            "success": True,
+            "message": f"{action}，已重新处理 {rekey_result.get('updated', 0)} 个闲鱼账号密码",
+            "updated": rekey_result.get("updated", 0),
+            "configured": bool(new_key),
+        }
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"更新闲鱼加密密钥失败: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # 检查是否使用默认密码
 @app.get('/api/check-default-password')
 async def check_default_password(current_user: Dict[str, Any] = Depends(get_current_user)):
@@ -1543,6 +1651,26 @@ def list_cookies(current_user: Dict[str, Any] = Depends(get_current_user)):
     return list(user_cookies.keys())
 
 
+def _mask_login_password(pwd: Optional[str]) -> str:
+    """对闲鱼登录密码做脱敏展示，避免向前端下发明文。
+
+    规则：
+    - 空 / None → ''
+    - 长度 <= 2：全部用 * 替换
+    - 长度 3-7：首末各保留 1 个字符，中间全部 *
+    - 长度 >= 8：首尾各保留 3 个字符，中间固定 **** （形如 xxx****xxx）
+    """
+    if not pwd:
+        return ''
+    s = str(pwd)
+    n = len(s)
+    if n <= 2:
+        return '*' * n
+    if n <= 7:
+        return s[0] + '*' * (n - 2) + s[-1]
+    return s[:3] + '****' + s[-3:]
+
+
 @app.get("/cookies/details")
 def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)):
     """获取所有Cookie的详细信息（包括值和状态）"""
@@ -1561,6 +1689,11 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
         # 获取备注信息
         cookie_details = db_manager.get_cookie_details(cookie_id)
         remark = cookie_details.get('remark', '') if cookie_details else ''
+        # 闲鱼登录密码做脱敏展示：返回 xxx****xxx 形式的掩码串，而不是明文；
+        # has_login_password 标记供前端判断是否已保存过密码
+        raw_pwd = (cookie_details or {}).get('password') or ''
+        masked_pwd = _mask_login_password(raw_pwd)
+        has_pwd = bool(raw_pwd)
 
         result.append({
             'id': cookie_id,
@@ -1570,7 +1703,8 @@ def get_cookies_details(current_user: Dict[str, Any] = Depends(get_current_user)
             'remark': remark,
             'pause_duration': cookie_details.get('pause_duration', 10) if cookie_details else 10,
             'username': cookie_details.get('username', '') if cookie_details else '',
-            'login_password': cookie_details.get('password', '') if cookie_details else '',
+            'login_password': masked_pwd,
+            'has_login_password': has_pwd,
             'show_browser': cookie_details.get('show_browser', False) if cookie_details else False
         })
     return result
@@ -1757,8 +1891,14 @@ def get_cookie_account_details(cid: str, current_user: Dict[str, Any] = Depends(
         
         if not details:
             raise HTTPException(status_code=404, detail="账号不存在")
-        
-        return details
+
+        # 脱敏：不向客户端下发闲鱼登录密码明文，返回 xxx****xxx 形式的掩码串；
+        # has_password 标记用于前端判断是否已保存过密码
+        safe_details = dict(details)
+        raw_pwd = safe_details.get('password') or ''
+        safe_details['has_password'] = bool(raw_pwd)
+        safe_details['password'] = _mask_login_password(raw_pwd)
+        return safe_details
     except HTTPException:
         raise
     except Exception as e:

@@ -372,7 +372,9 @@ export function Accounts() {
     setEditAutoConfirm(account.auto_confirm || false)
     setEditPauseDuration(account.pause_duration || 0)
     setEditUsername(account.username || '')
-    setEditLoginPassword(account.login_password || '')
+    // 出于安全考虑：打开编辑弹窗时永远不回显已保存的密码（即使后端意外下发），
+    // 用户需要改密码时再手动输入新值
+    setEditLoginPassword('')
     setEditShowBrowser(account.show_browser || false)
     setShowLoginPassword(false)
     setActiveModal('edit')
@@ -408,17 +410,23 @@ export function Accounts() {
       }
 
       // 更新登录信息
-      const loginInfoChanged = 
+      // 登录密码在后端已脱敏（下发为空串），只有当用户在输入框实际填入新值时才下发更新；
+      // 留空则保留原密码不变
+      const passwordChanged = editLoginPassword.trim() !== ''
+      const loginInfoChanged =
         editUsername !== (editingAccount.username || '') ||
-        editLoginPassword !== (editingAccount.login_password || '') ||
+        passwordChanged ||
         editShowBrowser !== (editingAccount.show_browser || false)
-      
+
       if (loginInfoChanged) {
-        promises.push(updateAccountLoginInfo(editingAccount.id, {
+        const payload: { username?: string; login_password?: string; show_browser?: boolean } = {
           username: editUsername,
-          login_password: editLoginPassword,
           show_browser: editShowBrowser,
-        }))
+        }
+        if (passwordChanged) {
+          payload.login_password = editLoginPassword
+        }
+        promises.push(updateAccountLoginInfo(editingAccount.id, payload))
       }
 
       await Promise.all(promises)
@@ -607,7 +615,7 @@ export function Accounts() {
               </div>
             </button>
 
-            {/* 账号密码登录 */}
+            {/* 闲鱼账号密码登录 */}
             <button
               onClick={() => handleOpenModal('password')}
               className="flex items-center gap-3 p-4 rounded-md border border-slate-200 dark:border-slate-700 
@@ -617,8 +625,8 @@ export function Accounts() {
                 <Key className="w-4 h-4 text-slate-600 dark:text-slate-300" />
               </div>
               <div>
-                <p className="font-medium text-slate-900 dark:text-slate-100 text-sm">账号密码</p>
-                <p className="text-xs text-slate-500 dark:text-slate-400">使用账号和密码</p>
+                <p className="font-medium text-slate-900 dark:text-slate-100 text-sm">闲鱼账号密码</p>
+                <p className="text-xs text-slate-500 dark:text-slate-400">使用闲鱼账号和密码登录</p>
               </div>
             </button>
 
@@ -849,20 +857,23 @@ export function Accounts() {
         </div>
       )}
 
-      {/* 密码登录弹窗 */}
+      {/* 闲鱼账号密码登录弹窗 */}
       {activeModal === 'password' && (
         <div className="modal-overlay">
           <div className="modal-content max-w-sm">
             <div className="modal-header">
-              <h2 className="modal-title">账号密码登录</h2>
+              <h2 className="modal-title">闲鱼账号密码登录</h2>
               <button onClick={closeModal} className="modal-close">
                 <X className="w-4 h-4" />
               </button>
             </div>
             <form onSubmit={handlePasswordLogin}>
               <div className="modal-body space-y-4">
+                <p className="text-xs text-slate-500 dark:text-slate-400">
+                  请填写闲鱼平台的账号与密码，用于自动登录闲鱼（不是本系统的登录密码）。
+                </p>
                 <div className="input-group">
-                  <label className="input-label">账号</label>
+                  <label className="input-label">闲鱼账号</label>
                   <input
                     type="text"
                     value={pwdAccount}
@@ -873,13 +884,14 @@ export function Accounts() {
                   />
                 </div>
                 <div className="input-group">
-                  <label className="input-label">密码</label>
+                  <label className="input-label">闲鱼账号密码</label>
                   <input
                     type="password"
                     value={pwdPassword}
                     onChange={(e) => setPwdPassword(e.target.value)}
                     className="input-ios"
-                    placeholder="请输入密码"
+                    placeholder="请输入闲鱼账号密码"
+                    autoComplete="new-password"
                   />
                 </div>
                 <label className="flex items-center gap-2 text-sm text-slate-600 dark:text-slate-300">
@@ -1063,28 +1075,37 @@ export function Accounts() {
                 <div className="border-t border-slate-200 dark:border-slate-700 pt-4 mt-2">
                   <h3 className="text-sm font-medium text-slate-700 dark:text-slate-300 mb-3 flex items-center gap-2">
                     <Key className="w-4 h-4 text-blue-500" />
-                    登录信息（用于自动登录）
+                    闲鱼登录信息（用于自动登录闲鱼，非本系统的登录密码）
                   </h3>
                   <div className="space-y-3">
                     <div className="input-group">
-                      <label className="input-label text-xs">登录账号</label>
+                      <label className="input-label text-xs">闲鱼账号</label>
                       <input
                         type="text"
                         value={editUsername}
                         onChange={(e) => setEditUsername(e.target.value)}
                         className="input-ios"
-                        placeholder="手机号或用户名"
+                        placeholder="闲鱼账号（手机号或用户名）"
                       />
                     </div>
                     <div className="input-group">
-                      <label className="input-label text-xs">登录密码</label>
+                      <label className="input-label text-xs">闲鱼账号密码</label>
+                      {editingAccount.has_login_password && editingAccount.login_password && (
+                        <div className="mb-2 flex items-center gap-2 px-3 py-2 rounded-md bg-slate-50 dark:bg-slate-800 border border-slate-200 dark:border-slate-700">
+                          <span className="text-xs text-slate-400 dark:text-slate-500 shrink-0">当前密码</span>
+                          <span className="font-mono text-sm text-slate-600 dark:text-slate-300 tracking-wider">
+                            {editingAccount.login_password}
+                          </span>
+                        </div>
+                      )}
                       <div className="relative">
                         <input
                           type={showLoginPassword ? 'text' : 'password'}
                           value={editLoginPassword}
                           onChange={(e) => setEditLoginPassword(e.target.value)}
                           className="input-ios pr-10"
-                          placeholder="登录密码"
+                          placeholder={editingAccount.has_login_password ? '留空则保留原密码，填写则更新为新密码' : '闲鱼账号密码'}
+                          autoComplete="new-password"
                         />
                         <button
                           type="button"
@@ -1094,6 +1115,9 @@ export function Accounts() {
                           {showLoginPassword ? <EyeOff className="w-4 h-4" /> : <Eye className="w-4 h-4" />}
                         </button>
                       </div>
+                      <p className="text-xs text-slate-400 dark:text-slate-500 mt-1">
+                        出于安全考虑，已保存的密码仅以脱敏形式展示；仅在此处填入新密码才会更新。
+                      </p>
                     </div>
                     <div className="flex items-center justify-between">
                       <div>

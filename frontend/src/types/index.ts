@@ -44,6 +44,8 @@ export interface AccountDetail extends Account {
   keywordCount?: number
   username?: string
   login_password?: string
+  /** 后端脱敏标记：true 表示数据库中已保存闲鱼登录密码（但出于安全不会明文下发） */
+  has_login_password?: boolean
   show_browser?: boolean
 }
 
@@ -115,6 +117,7 @@ export interface Order {
   // 由后端 JOIN item_info 注入
   pic_url?: string | null
   item_title?: string | null
+  item_price?: string | null  // 商品标价（item_info.item_price），与订单 amount（实付）区分
 }
 
 export type OrderStatus = 

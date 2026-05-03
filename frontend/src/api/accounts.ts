@@ -39,6 +39,7 @@ export const getAccountDetails = async (): Promise<AccountDetail[]> => {
     pause_duration?: number
     username?: string
     login_password?: string
+    has_login_password?: boolean
     show_browser?: boolean
   }
   const data = await get<BackendAccountDetail[]>('/cookies/details')
@@ -51,7 +52,9 @@ export const getAccountDetails = async (): Promise<AccountDetail[]> => {
     note: item.remark,
     pause_duration: item.pause_duration,
     username: item.username,
+    // 后端已脱敏，login_password 恒为空串；是否已设置密码看 has_login_password
     login_password: item.login_password,
+    has_login_password: !!item.has_login_password,
     show_browser: item.show_browser,
     use_ai_reply: false,
     use_default_reply: false,

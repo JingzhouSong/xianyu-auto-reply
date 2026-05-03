@@ -413,15 +413,55 @@ class OrderDetailFetcher:
             print(f"🔍 找到 {len(sku_elements)} 个 sku--u_ddZval 元素")
 
             # 获取金额信息
+            # 闲鱼订单详情页上 `.boldNum--JgEOXfA3` 会出现多次：
+            #   - 商品卡片里的"商品价"（挂牌价）
+            #   - 明细里的"实付款"（小刀后真正支付的钱）
+            # 旧版只 query_selector 取首个，导致小刀订单把挂牌价当成实付入库。
+            # 修复：优先取与「实付/付款/需付款」文案关联的那个；否则取最后一个（实付在页面最下方）。
             amount_selector = '.boldNum--JgEOXfA3'
-            amount_element = await self.page.query_selector(amount_selector)
+            amount_elements = await self.page.query_selector_all(amount_selector)
             amount = ''
-            if amount_element:
-                amount_text = await amount_element.text_content()
-                if amount_text:
-                    amount = amount_text.strip()
-                    logger.info(f"找到金额: {amount}")
-                    print(f"💰 金额: {amount}")
+            if amount_elements:
+                picked_text = None
+                picked_reason = ''
+                # 1) 优先：最近的祖先文本含"实付"/"付款"关键词
+                try:
+                    for el in amount_elements:
+                        ctx = await el.evaluate(
+                            """(node) => {
+                                let n = node;
+                                for (let i = 0; i < 6 && n && n.parentElement; i++) {
+                                    n = n.parentElement;
+                                    const t = (n.innerText || n.textContent || '').replace(/\\s+/g, '');
+                                    if (/实付|付款金额|需付款|应付款/.test(t)) return t;
+                                }
+                                return '';
+                            }"""
+                        )
+                        if ctx:
+                            txt = await el.text_content()
+                            if txt and txt.strip():
+                                picked_text = txt.strip()
+                                picked_reason = f"匹配到实付上下文({ctx[:40]}...)"
+                                break
+                except Exception as e:
+                    logger.debug(f"识别实付上下文失败，回退到末位策略: {e}")
+                # 2) 回退：取最后一个（实付金额通常是订单明细的最后一行）
+                if not picked_text:
+                    last_txt = await amount_elements[-1].text_content()
+                    if last_txt and last_txt.strip():
+                        picked_text = last_txt.strip()
+                        picked_reason = f"未匹配到实付关键词，取最后一个 boldNum (共 {len(amount_elements)} 个)"
+                # 3) 最终兜底：取第一个
+                if not picked_text:
+                    first_txt = await amount_elements[0].text_content()
+                    if first_txt:
+                        picked_text = first_txt.strip()
+                        picked_reason = "兜底：取第一个 boldNum"
+                if picked_text:
+                    amount = picked_text
+                    logger.info(f"找到金额: {amount}（{picked_reason}）")
+                    print(f"💰 金额: {amount} [{picked_reason}]")
                     result['amount'] = amount
             else:
                 logger.warning("未找到金额元素")

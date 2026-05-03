@@ -96,6 +96,9 @@ class DBManager:
                     self._execute_sql(cursor, "ALTER TABLE users ADD COLUMN register_ip TEXT")
                     self._execute_sql(cursor, "CREATE INDEX IF NOT EXISTS idx_users_register_ip ON users(register_ip)")
                     logger.info("users 表新增 register_ip 列")
+                if 'xianyu_enc_key' not in _ucols:
+                    self._execute_sql(cursor, "ALTER TABLE users ADD COLUMN xianyu_enc_key TEXT")
+                    logger.info("users 表新增 xianyu_enc_key 列（闲鱼账号密码加密密钥）")
             except Exception as _e:
                 logger.error(f"users 表迁移失败: {_e}")
 
@@ -449,6 +452,49 @@ class DBManager:
                 logger.info("正在为 cards 表添加 bonus_tiers 列...")
                 self._execute_sql(cursor, "ALTER TABLE cards ADD COLUMN bonus_tiers TEXT")
                 logger.info("cards 表 bonus_tiers 列添加完成")
+
+            # 一次性数据修复：历史 Bug 把浏览器抓取的纯文本描述错误写入了 item_detail 列，
+            # 覆盖了含 pic_info 的 JSON，导致商品列表页图片展示为空。
+            # 迁移策略：凡 item_detail 不是合法 JSON 且 item_description 为空的行，
+            # 把 item_detail 文本搬到 item_description，并清空 item_detail 让下次拉取自愈。
+            try:
+                self._execute_sql(cursor, "SELECT COUNT(1) FROM item_info WHERE 1=0")
+                cursor.execute("""
+                    SELECT id, item_detail, COALESCE(item_description,'') FROM item_info
+                    WHERE item_detail IS NOT NULL AND TRIM(item_detail) <> ''
+                """)
+                _rows = cursor.fetchall()
+                _fix_ids = []
+                _fix_pairs = []
+                for _row_id, _detail_val, _desc_val in _rows:
+                    _s = (_detail_val or '').lstrip()
+                    # 合法 JSON 特征：以 { 或 [ 开头；否则一律视为被污染的纯文本
+                    if _s.startswith('{') or _s.startswith('['):
+                        continue
+                    # 只有 item_description 为空才迁移，避免覆盖用户手动编辑的内容
+                    if (_desc_val or '').strip():
+                        _fix_ids.append(_row_id)  # 仅清空 item_detail，不覆盖现有描述
+                    else:
+                        _fix_pairs.append((_detail_val, _row_id))
+                if _fix_pairs:
+                    cursor.executemany(
+                        "UPDATE item_info SET item_description = ?, item_detail = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        _fix_pairs,
+                    )
+                if _fix_ids:
+                    cursor.executemany(
+                        "UPDATE item_info SET item_detail = NULL, updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+                        [(i,) for i in _fix_ids],
+                    )
+                _total_fixed = len(_fix_pairs) + len(_fix_ids)
+                if _total_fixed > 0:
+                    self.conn.commit()
+                    logger.warning(
+                        f"🔧 已修复 {_total_fixed} 条商品记录：把被污染的 item_detail 纯文本迁移到 item_description，"
+                        f"清空 item_detail 让下次获取商品时重新拉取含 pic_info 的 JSON（恢复图片展示）"
+                    )
+            except Exception as _mig_e:
+                logger.warning(f"item_detail 数据迁移跳过（非致命）: {_mig_e}")
 
             # 创建默认回复表（支持账号级别和商品级别）
             cursor.execute('''
@@ -1479,22 +1525,37 @@ class DBManager:
                 return None
 
     def get_cookie_details(self, cookie_id: str) -> Optional[Dict[str, any]]:
-        """获取Cookie的详细信息，包括user_id、auto_confirm、remark、pause_duration、username、password和show_browser"""
+        """获取Cookie的详细信息，包括user_id、auto_confirm、remark、pause_duration、username、password和show_browser
+
+        注：password 字段若为密文，会使用该账号所属用户的 xianyu_enc_key 自动解密后返回；
+        若密钥未配置或解密失败，password 字段返回空串。
+        """
         with self.lock:
             try:
                 cursor = self.conn.cursor()
                 self._execute_sql(cursor, "SELECT id, value, user_id, auto_confirm, remark, pause_duration, username, password, show_browser, created_at FROM cookies WHERE id = ?", (cookie_id,))
                 result = cursor.fetchone()
                 if result:
+                    stored_password = result[7] or ''
+                    user_id = result[2]
+                    plain_password = stored_password
+                    try:
+                        from utils.xianyu_crypto import decrypt_password, is_encrypted
+                        if is_encrypted(stored_password):
+                            user_key = self._get_user_xianyu_key_nolock(cursor, user_id)
+                            plain_password = decrypt_password(stored_password, user_key, user_id)
+                    except Exception as _e:
+                        logger.error(f"解密账号 {cookie_id} 密码失败: {_e}")
+                        plain_password = ''
                     return {
                         'id': result[0],
                         'value': result[1],
-                        'user_id': result[2],
+                        'user_id': user_id,
                         'auto_confirm': bool(result[3]),
                         'remark': result[4] or '',
                         'pause_duration': result[5] if result[5] is not None else 10,  # 0是有效值，表示不暂停
                         'username': result[6] or '',
-                        'password': result[7] or '',
+                        'password': plain_password,
                         'show_browser': bool(result[8]) if result[8] is not None else False,
                         'created_at': result[9]
                     }
@@ -1502,6 +1563,90 @@ class DBManager:
             except Exception as e:
                 logger.error(f"获取Cookie详细信息失败: {e}")
                 return None
+
+    # -------------------- 闲鱼密码加密密钥 --------------------
+    def _get_user_xianyu_key_nolock(self, cursor, user_id: int) -> Optional[str]:
+        """读取用户的闲鱼密码加密密钥（不加锁，调用方需自行持有 self.lock）。"""
+        if user_id is None:
+            return None
+        try:
+            self._execute_sql(cursor, "SELECT xianyu_enc_key FROM users WHERE id = ?", (int(user_id),))
+            row = cursor.fetchone()
+            if row and row[0]:
+                return row[0]
+            return None
+        except Exception as e:
+            logger.error(f"读取用户 {user_id} 的闲鱼加密密钥失败: {e}")
+            return None
+
+    def get_user_xianyu_key(self, user_id: int) -> Optional[str]:
+        """获取指定用户的闲鱼密码加密密钥（未配置时返回 None）。"""
+        with self.lock:
+            cursor = self.conn.cursor()
+            return self._get_user_xianyu_key_nolock(cursor, user_id)
+
+    def set_user_xianyu_key(self, user_id: int, new_key: Optional[str]) -> bool:
+        """设置/清除用户的闲鱼密码加密密钥（只更新 users 表，不触及 cookies 密码字段）。"""
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                value = new_key if (new_key is not None and new_key != '') else None
+                self._execute_sql(cursor, "UPDATE users SET xianyu_enc_key = ? WHERE id = ?", (value, int(user_id)))
+                self.conn.commit()
+                return True
+            except Exception as e:
+                logger.error(f"更新用户 {user_id} 闲鱼加密密钥失败: {e}")
+                self.conn.rollback()
+                return False
+
+    def rekey_user_xianyu_passwords(self, user_id: int, old_key: Optional[str], new_key: Optional[str]) -> Dict[str, Any]:
+        """使用 old_key 解密该用户名下所有闲鱼账号密码，再用 new_key 重新加密后写回。
+
+        - old_key 为空：视所有存储值为明文（只把非空密码用 new_key 加密）；
+        - new_key 为空：将所有密码还原为明文存储；
+        - 两者都为空：无操作。
+
+        返回 {success: bool, updated: int, failed: int, errors: [..]}。
+        """
+        from utils.xianyu_crypto import encrypt_password, decrypt_password, is_encrypted
+        result = {"success": True, "updated": 0, "failed": 0, "errors": []}
+        with self.lock:
+            try:
+                cursor = self.conn.cursor()
+                self._execute_sql(cursor, "SELECT id, password FROM cookies WHERE user_id = ?", (int(user_id),))
+                rows = cursor.fetchall()
+                for cid, stored in rows:
+                    try:
+                        if stored is None or stored == '':
+                            continue
+                        # 先解密成明文
+                        if is_encrypted(stored):
+                            if not old_key:
+                                result["failed"] += 1
+                                result["errors"].append(f"{cid}: 已加密但未提供旧密钥")
+                                continue
+                            plain = decrypt_password(stored, old_key, user_id)
+                            if plain == '' and stored:
+                                result["failed"] += 1
+                                result["errors"].append(f"{cid}: 使用旧密钥解密失败")
+                                continue
+                        else:
+                            plain = stored  # 历史明文
+                        # 再按新密钥加密（new_key 为空则写回明文）
+                        new_stored = encrypt_password(plain, new_key, user_id) if new_key else plain
+                        self._execute_sql(cursor, "UPDATE cookies SET password = ? WHERE id = ?", (new_stored, cid))
+                        result["updated"] += 1
+                    except Exception as e:  # noqa: BLE001
+                        result["failed"] += 1
+                        result["errors"].append(f"{cid}: {e}")
+                self.conn.commit()
+                if result["failed"] > 0:
+                    result["success"] = False
+                return result
+            except Exception as e:
+                logger.error(f"用户 {user_id} 闲鱼密码批量换密失败: {e}")
+                self.conn.rollback()
+                return {"success": False, "updated": 0, "failed": 0, "errors": [str(e)]}
 
     def update_auto_confirm(self, cookie_id: str, auto_confirm: bool) -> bool:
         """更新Cookie的自动确认发货设置"""
@@ -1573,8 +1718,9 @@ class DBManager:
                 cursor = self.conn.cursor()
                 
                 # 检查记录是否存在
-                self._execute_sql(cursor, "SELECT id FROM cookies WHERE id = ?", (cookie_id,))
-                exists = cursor.fetchone() is not None
+                self._execute_sql(cursor, "SELECT id, user_id FROM cookies WHERE id = ?", (cookie_id,))
+                _existing_row = cursor.fetchone()
+                exists = _existing_row is not None
                 
                 if not exists:
                     # 记录不存在，需要创建新记录
@@ -1588,6 +1734,15 @@ class DBManager:
                         self._execute_sql(cursor, "SELECT id FROM users WHERE username = 'admin'")
                         admin_user = cursor.fetchone()
                         user_id = admin_user[0] if admin_user else 1
+                    
+                    # 如果传入了 password，按用户密钥加密后再写库（未配置密钥则保持明文）
+                    if password is not None and password != '':
+                        try:
+                            from utils.xianyu_crypto import encrypt_password
+                            user_key = self._get_user_xianyu_key_nolock(cursor, user_id)
+                            password = encrypt_password(password, user_key, user_id)
+                        except Exception as _e:
+                            logger.error(f"加密账号 {cookie_id} 密码失败（创建路径），按明文保存: {_e}")
                     
                     # 构建插入语句
                     insert_fields = ['id', 'value', 'user_id']
@@ -1629,6 +1784,15 @@ class DBManager:
                         params.append(username)
                     
                     if password is not None:
+                        # 已存在记录，按记录所属用户的密钥加密 password 后再写库
+                        if password != '':
+                            try:
+                                from utils.xianyu_crypto import encrypt_password
+                                _owner_uid = _existing_row[1] if _existing_row else user_id
+                                _user_key = self._get_user_xianyu_key_nolock(cursor, _owner_uid)
+                                password = encrypt_password(password, _user_key, _owner_uid)
+                            except Exception as _e:
+                                logger.error(f"加密账号 {cookie_id} 密码失败（更新路径），按明文保存: {_e}")
                         update_fields.append("password = ?")
                         params.append(password)
                     
@@ -4502,13 +4666,13 @@ class DBManager:
                 if restored:
                     return False, "该记录已恢复，请勿重复操作"
 
-                # 检查卡券是否仍存在且为 data 类型
+                # 检查卡券是否仍存在且为批量类型（与 consume_batch_data 一致：data / cred 两种）
                 self._execute_sql(cursor, "SELECT data_content, type FROM cards WHERE id = ?", (card_id,))
                 card_row = cursor.fetchone()
                 if not card_row:
                     return False, "卡券已删除，无法恢复"
-                if card_row[1] != 'data':
-                    return False, "卡券类型已变更，无法恢复"
+                if card_row[1] not in ('data', 'cred'):
+                    return False, f"卡券类型为 {card_row[1]}，仅支持恢复批量数据/批量账密类型"
 
                 current = card_row[0] or ''
                 # 追加到末尾，保留换行；如已存在则先去重不重复追加
@@ -4941,16 +5105,36 @@ class DBManager:
             logger.error(f"获取所有商品信息失败: {e}")
             return []
 
+    def update_item_description(self, cookie_id: str, item_id: str, description_text: str) -> bool:
+        """更新商品的文字描述（item_description 列），不会覆盖 item_detail JSON。
+
+        用于：浏览器抓取到的商品描述正文、用户在 UI 手动编辑的商品说明。
+        绝对不要把这里的文字塞到 item_detail 列 —— 那一列保留给含 pic_info 的结构化 JSON，
+        否则会导致列表页商品图片消失（_extract_pic_url 无法从纯文本解析出主图）。
+        """
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                UPDATE item_info SET
+                    item_description = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE cookie_id = ? AND item_id = ?
+                ''', (description_text, cookie_id, item_id))
+
+                if cursor.rowcount > 0:
+                    self.conn.commit()
+                    logger.info(f"更新商品描述成功: {item_id}")
+                    return True
+                return False
+        except Exception as e:
+            logger.error(f"更新商品描述失败: {e}")
+            return False
+
     def update_item_detail(self, cookie_id: str, item_id: str, item_detail: str) -> bool:
-        """更新商品详情（不覆盖商品标题等基本信息）
+        """更新商品详情 JSON（不覆盖商品标题等基本信息）。
 
-        Args:
-            cookie_id: Cookie ID
-            item_id: 商品ID
-            item_detail: 商品详情JSON字符串
-
-        Returns:
-            bool: 操作是否成功
+        ⚠️ 此方法仅用于写入结构化 JSON（含 pic_info）；若传入的是纯文本描述，
+        请改调用 update_item_description，否则会破坏图片展示。
         """
         try:
             with self.lock:
@@ -5565,7 +5749,7 @@ class DBManager:
                 cursor.execute('''
                 SELECT o.order_id, o.item_id, o.buyer_id, o.spec_name, o.spec_value,
                        o.quantity, o.amount, o.order_status, o.cookie_id, o.is_bargain, o.created_at, o.updated_at,
-                       i.item_title, i.item_detail
+                       i.item_title, i.item_detail, i.item_price
                 FROM orders o
                 LEFT JOIN item_info i ON i.cookie_id = o.cookie_id AND i.item_id = o.item_id
                 WHERE o.order_id = ?
@@ -5594,6 +5778,7 @@ class DBManager:
                         'updated_at': row[11],
                         'item_title': row[12],
                         'pic_url': pic_url,
+                        'item_price': row[14],  # 商品标价（来自 item_info.item_price）
                     }
                 return None
 
@@ -5625,7 +5810,7 @@ class DBManager:
                 cursor.execute('''
                 SELECT o.order_id, o.item_id, o.buyer_id, o.spec_name, o.spec_value,
                        o.quantity, o.amount, o.order_status, o.is_bargain, o.created_at, o.updated_at,
-                       i.item_title, i.item_detail
+                       i.item_title, i.item_detail, i.item_price
                 FROM orders o
                 LEFT JOIN item_info i ON i.cookie_id = o.cookie_id AND i.item_id = o.item_id
                 WHERE o.cookie_id = ?
@@ -5650,6 +5835,7 @@ class DBManager:
                         'updated_at': row[10],
                         'item_title': row[11],
                         'pic_url': pic_url,
+                        'item_price': row[13],  # 商品标价（来自 item_info.item_price）
                     })
 
                 return orders
